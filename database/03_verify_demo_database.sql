@@ -71,8 +71,12 @@ BEGIN
  IF NOT (SELECT available FROM public.slots WHERE slot_id=next_slot) THEN
    RAISE EXCEPTION 'Cancellation failed to release the slot';
  END IF;
- IF (SELECT count(*) FROM public.appointment_change_history) <> before_history+4 THEN
-   RAISE EXCEPTION 'Expected booking, name-update, reschedule and cancellation history';
+ IF (SELECT count(*) FROM public.appointment_change_history WHERE appointment_id=appointment) <> 5
+    OR (SELECT count(*) FROM public.appointment_change_history WHERE appointment_id=appointment AND action='booked') <> 1
+    OR (SELECT count(*) FROM public.appointment_change_history WHERE appointment_id=appointment AND action='details_updated') <> 2
+    OR (SELECT count(*) FROM public.appointment_change_history WHERE appointment_id=appointment AND action='rescheduled') <> 1
+    OR (SELECT count(*) FROM public.appointment_change_history WHERE appointment_id=appointment AND action='cancelled') <> 1 THEN
+   RAISE EXCEPTION 'Expected five history entries: booking, reason update, name update, reschedule and cancellation';
  END IF;
  IF has_table_privilege('anon','public.appointments','SELECT')
     OR has_table_privilege('authenticated','public.appointments','UPDATE')

@@ -9,6 +9,9 @@ Reference counts: 13 services, 65 doctors, 67 mappings, 19 knowledge records.
 Doctor and service references: valid.
 Generated demonstration slots: 8,400 expected (67 x 30 x 4 + 6 x 30 x 2).
 Private appointments, histories, recordings and credentials: not included.
-LIVE SQL EXECUTION: NOT PERFORMED.
+SUPABASE DEMONSTRATION: user reported successful schema installation, data seeding and corrected rollback verification on 14 October 2026.
 LIVE API CALLS: NONE.
 WORKING PROJECT AND DATABASE: NOT MODIFIED.
+
+Constraint creation order corrected. History verification checks five entries, including the booking-reason update.
+Browser and telephone execution against this demonstration database remain to be checked.

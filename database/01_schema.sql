@@ -130,27 +130,15 @@ CREATE TABLE public."synthetic_test_scenario_results" (
 
 ALTER TABLE public."appointment_change_history" ADD CONSTRAINT "appointment_change_history_pkey" PRIMARY KEY (history_id);
 
-ALTER TABLE public."appointments" ADD CONSTRAINT "appointments_doctor_id_fkey" FOREIGN KEY (doctor_id) REFERENCES doctors(doctor_id);
-
 ALTER TABLE public."appointments" ADD CONSTRAINT "appointments_pkey" PRIMARY KEY (appointment_id);
 
 ALTER TABLE public."appointments" ADD CONSTRAINT "appointments_reschedule_count_check" CHECK ((reschedule_count >= 0));
 
-ALTER TABLE public."appointments" ADD CONSTRAINT "appointments_slot_id_fkey" FOREIGN KEY (slot_id) REFERENCES slots(slot_id);
-
 ALTER TABLE public."clinic_knowledge" ADD CONSTRAINT "clinic_knowledge_pkey" PRIMARY KEY (knowledge_id);
-
-ALTER TABLE public."doctor_services" ADD CONSTRAINT "doctor_services_doctor_id_fkey" FOREIGN KEY (doctor_id) REFERENCES doctors(doctor_id) ON DELETE CASCADE;
 
 ALTER TABLE public."doctor_services" ADD CONSTRAINT "doctor_services_pkey" PRIMARY KEY (doctor_id, service_id);
 
-ALTER TABLE public."doctor_services" ADD CONSTRAINT "doctor_services_service_id_fkey" FOREIGN KEY (service_id) REFERENCES services(service_id) ON DELETE CASCADE;
-
 ALTER TABLE public."doctors" ADD CONSTRAINT "doctors_pkey" PRIMARY KEY (doctor_id);
-
-ALTER TABLE public."doctors" ADD CONSTRAINT "doctors_service_id_fkey" FOREIGN KEY (service_id) REFERENCES services(service_id);
-
-ALTER TABLE public."medical_certificate_requests" ADD CONSTRAINT "medical_certificate_requests_appointment_id_fkey" FOREIGN KEY (appointment_id) REFERENCES appointments(appointment_id) ON DELETE CASCADE;
 
 ALTER TABLE public."medical_certificate_requests" ADD CONSTRAINT "medical_certificate_requests_appointment_id_key" UNIQUE (appointment_id);
 
@@ -166,17 +154,29 @@ ALTER TABLE public."services" ADD CONSTRAINT "services_pkey" PRIMARY KEY (servic
 
 ALTER TABLE public."services" ADD CONSTRAINT "services_service_name_key" UNIQUE (service_name);
 
-ALTER TABLE public."slots" ADD CONSTRAINT "slots_doctor_id_fkey" FOREIGN KEY (doctor_id) REFERENCES doctors(doctor_id);
-
 ALTER TABLE public."slots" ADD CONSTRAINT "slots_pkey" PRIMARY KEY (slot_id);
-
-ALTER TABLE public."slots" ADD CONSTRAINT "slots_service_id_fkey" FOREIGN KEY (service_id) REFERENCES services(service_id);
 
 ALTER TABLE public."slots" ADD CONSTRAINT "unique_provider_service_slot" UNIQUE (doctor_id, service_id, appointment_date, appointment_time);
 
 ALTER TABLE public."synthetic_test_runs" ADD CONSTRAINT "synthetic_test_runs_pkey" PRIMARY KEY (run_id);
 
 ALTER TABLE public."synthetic_test_scenario_results" ADD CONSTRAINT "synthetic_test_scenario_results_pkey" PRIMARY KEY (run_id, scenario_id);
+
+ALTER TABLE public."appointments" ADD CONSTRAINT "appointments_doctor_id_fkey" FOREIGN KEY (doctor_id) REFERENCES doctors(doctor_id);
+
+ALTER TABLE public."appointments" ADD CONSTRAINT "appointments_slot_id_fkey" FOREIGN KEY (slot_id) REFERENCES slots(slot_id);
+
+ALTER TABLE public."doctor_services" ADD CONSTRAINT "doctor_services_doctor_id_fkey" FOREIGN KEY (doctor_id) REFERENCES doctors(doctor_id) ON DELETE CASCADE;
+
+ALTER TABLE public."doctor_services" ADD CONSTRAINT "doctor_services_service_id_fkey" FOREIGN KEY (service_id) REFERENCES services(service_id) ON DELETE CASCADE;
+
+ALTER TABLE public."doctors" ADD CONSTRAINT "doctors_service_id_fkey" FOREIGN KEY (service_id) REFERENCES services(service_id);
+
+ALTER TABLE public."medical_certificate_requests" ADD CONSTRAINT "medical_certificate_requests_appointment_id_fkey" FOREIGN KEY (appointment_id) REFERENCES appointments(appointment_id) ON DELETE CASCADE;
+
+ALTER TABLE public."slots" ADD CONSTRAINT "slots_doctor_id_fkey" FOREIGN KEY (doctor_id) REFERENCES doctors(doctor_id);
+
+ALTER TABLE public."slots" ADD CONSTRAINT "slots_service_id_fkey" FOREIGN KEY (service_id) REFERENCES services(service_id);
 
 ALTER TABLE public."synthetic_test_scenario_results" ADD CONSTRAINT "synthetic_test_scenario_results_run_id_fkey" FOREIGN KEY (run_id) REFERENCES synthetic_test_runs(run_id);
 
