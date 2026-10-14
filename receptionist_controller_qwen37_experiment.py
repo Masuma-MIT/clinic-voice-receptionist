@@ -5972,31 +5972,55 @@ class ReceptionistSession:
                 ' Which option would you prefer?')
 
     def _stable_fact_v4(self, text):
+        """Answer every explicitly requested administrative facility from active records."""
         import re
         value = self._normalize_confirmation_text(text)
+        topics = [
+            ('Public Cafeteria', 'cafeteria', r'\b(?:cafeteria|cafeterias|cafe|cafes|canteen|canteens)\b'),
+            ('Prayer Area', 'prayer area', r'\b(?:pray|prays|prayer|prayers|praying|worship|multi faith)\b'),
+            ("Children's Play Area", "children's play area", r'\b(?:playground|playgrounds|play area|play areas|space to play|children to play|kids to play)\b'),
+            ('Onsite Pharmacy', 'onsite pharmacy', r'\b(?:pharmacy|pharmacies|chemist|chemists|medicine shop)\b'),
+            ('Patient Waiting Area', 'patient waiting area', r'\b(?:waiting area|waiting room|waiting space|seating|seats|place to sit|somewhere to sit|place to rest|somewhere to rest|take (?:some |a )?rest before)\b'),
+            ('Private Breastfeeding Area', 'breastfeeding area', r'\b(?:breastfeeding|breast feeding|breastfeed|infant care|baby care|nursing room)\b'),
+        ]
         selected = []
-        if re.search(r'\b(?:cafeteria|cafe|canteen)\b',value): selected.append(('Public Cafeteria','cafeteria'))
-        if re.search(r'\b(?:pray|prayer|worship|multi faith)\b',value): selected.append(('Prayer Area','prayer area'))
-        if re.search(r'\b(?:playground|play area|space to play|children to play|kids to play)\b',value): selected.append(('Children\'s Play Area','children\'s play area'))
-        if re.search(r'\b(?:open|opening|close|closing|hours)\b',value) and (not selected or 'clinic' in value): selected.append(('Clinic Opening Hours','clinic opening hours'))
+        for title, label, pattern in topics:
+            match = re.search(pattern, value)
+            if match:
+                selected.append((match.start(), title, label))
+        # A facility question mentioning "your clinic" must not become clinic hours.
+        explicit_clinic_hours = bool(re.search(
+            r'\b(?:clinic|hospital|reception) (?:opening hours|operating hours|business hours|hours)\b'
+            r'|\b(?:opening|operating|business) hours (?:of|for|at) (?:the |your )?(?:clinic|hospital|reception)\b', value))
+        clinic_hours = explicit_clinic_hours or (not selected and bool(re.search(
+            r'\b(?:clinic|hospital|reception) (?:open|opens|close|closes|opening|closing)\b', value)))
+        generic_hours = bool(re.fullmatch(
+            r'(?:hello |hi |okay |ok )?(?:what (?:are )?(?:your |the )?(?:opening|operating|business) hours'
+            r'|when (?:do|are) you (?:open|close|opening|closing)'
+            r'|what time (?:do|are) you (?:open|close|opening|closing))(?: please)?', value))
+        if clinic_hours or (not selected and generic_hours):
+            selected.append((len(value), 'Clinic Opening Hours', 'clinic opening hours'))
         if not selected:
             return None
-        rows = [row for row in knowledge_rows if row.get('active',True) is True]
-        answers=[]
-        for title,label in selected:
-            contents=list(dict.fromkeys(str(row.get('content') or '').strip() for row in rows
-                if self._normalize_confirmation_text(row.get('title',''))==self._normalize_confirmation_text(title) and str(row.get('content') or '').strip()))
-            if len(contents)==1:
-                answer=contents[0]
-                if title=="Children's Play Area":
-                    old=[str(row.get('content') or '') for row in rows if self._normalize_confirmation_text(row.get('title',''))=='children s playground']
-                    if any(re.search(r'\b(?:no|not)\b',s.lower()) and 'play area' in s.lower() for s in old):
+        rows = [row for row in knowledge_rows if row.get('active', True) is True]
+        answers = []
+        for _, title, label in sorted(selected):
+            contents = list(dict.fromkeys(
+                str(row.get('content') or '').strip() for row in rows
+                if self._normalize_confirmation_text(row.get('title', '')) == self._normalize_confirmation_text(title)
+                and str(row.get('content') or '').strip()))
+            if len(contents) == 1:
+                answer = contents[0]
+                if title == "Children's Play Area":
+                    old = [str(row.get('content') or '') for row in rows
+                           if self._normalize_confirmation_text(row.get('title', '')) == 'children s playground']
+                    if any(re.search(r'\b(?:no|not)\b', content.lower()) and 'play area' in content.lower() for content in old):
                         answer += ' Another active record says there is no play area, so these records conflict and the facility needs confirmation.'
                 answers.append(answer)
-            elif len(contents)>1:
-                answers.append('The active '+label+' records conflict, so I cannot give one confirmed answer.')
+            elif len(contents) > 1:
+                answers.append('The active ' + label + ' records conflict, so I cannot give one confirmed answer.')
             else:
-                answers.append('The current records do not specify the '+label+'.')
+                answers.append('The current records do not specify the ' + label + '.')
         return ' '.join(dict.fromkeys(answers))
 
     def _verified_static_clinic_answer(self, text):
