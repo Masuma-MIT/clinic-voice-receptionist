@@ -1,0 +1,14 @@
+OFFLINE PACKAGING VALIDATION
+Source: user-supplied Supabase exports, 14 October 2026.
+SQL parsing: all three scripts passed.
+PL/pgSQL parsing: six source function bodies and three verification/guard DO blocks passed.
+Supplied application function definitions: 6/6 preserved.
+Supplied constraints: 26/26 included.
+Appointment triggers: 2/2 included.
+Reference counts: 13 services, 65 doctors, 67 mappings, 19 knowledge records.
+Doctor and service references: valid.
+Generated demonstration slots: 8,400 expected (67 x 30 x 4 + 6 x 30 x 2).
+Private appointments, histories, recordings and credentials: not included.
+LIVE SQL EXECUTION: NOT PERFORMED.
+LIVE API CALLS: NONE.
+WORKING PROJECT AND DATABASE: NOT MODIFIED.
