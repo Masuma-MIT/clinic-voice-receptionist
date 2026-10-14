@@ -62,3 +62,11 @@ This source package does not currently include participant recordings or test re
 ## Review status
 The 15 submitted Python modules passed static syntax checks during packaging.
 This does not establish successful installation or a live demonstration on a different computer.
+
+## Access and execution
+
+This repository contains the browser and Twilio implementations, demonstration database scripts, and setup instructions. Credentials are excluded from the public repository. Running the system requires authorised API credentials and the configuration described in the setup guides. Assistance with execution can be arranged if further verification is required.
+
+- [Professor access guide — Word document](docs/Professor_AI_Receptionist_Access_Guide.docx)
+- [Demonstration database setup](README_DATABASE_SETUP.md)
+- [Speaker-model setup](README_SPEAKER_SETUP.md)
