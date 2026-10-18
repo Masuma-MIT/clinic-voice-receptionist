@@ -14,4 +14,11 @@ LIVE API CALLS: NONE.
 WORKING PROJECT AND DATABASE: NOT MODIFIED.
 
 Constraint creation order corrected. History verification checks five entries, including the booking-reason update.
-Browser and telephone execution against this demonstration database remain to be checked.
+FOLLOW-UP SUBMISSION-COPY CHECKS (14 October 2026):
+- User reported successful browser interaction against the demonstration database.
+- Supplied output confirmed no broken requirements in the main and speaker environments.
+- Supplied output confirmed speaker-worker readiness and telephone gateway startup.
+- Public telephone preflight returned ready. A telephone conversation was subsequently reported.
+- A partial-answer observation prompted an enquiry-coverage repair; its installer reported 42 passing offline enquiry cases and 15/15 source syntax checks.
+- No further telephone call was performed after that enquiry repair.
+These follow-up checks do not establish independent installation or comprehensive end-to-end performance on another computer.
