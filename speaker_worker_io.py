@@ -56,6 +56,11 @@ def request_worker(process, output, request, timeout, prefix="V3_RESULT "):
                 raise RuntimeError("Speaker worker output reader failed: " + value)
             if kind == "eof":
                 raise RuntimeError("Speaker worker stopped unexpectedly.")
+            if value.startswith("V3_TIMING "):
+                # Forward performance-only worker events to the gateway console.
+                # They remain separate from the V3_RESULT response protocol.
+                print(value.rstrip(), flush=True)
+                continue
             if value.startswith(prefix):
                 result = json.loads(value[len(prefix):])
                 if not isinstance(result, dict):

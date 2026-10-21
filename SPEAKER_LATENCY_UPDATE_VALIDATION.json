@@ -1,0 +1,25 @@
+{
+  "update": "speaker_worker_cpu_cache_timing_v1",
+  "installed_at": "2026-10-20T17:29:10.449871+11:00",
+  "observed_problem": "A recorded telephone assessment took 36948.18 ms and ended in TimeoutError.",
+  "changes": [
+    "Configurable isolated-worker PyTorch threads, default 1",
+    "Bounded in-memory cache for 8 exact reference-waveform embeddings",
+    "Per-stage worker timings forwarded to the gateway console"
+  ],
+  "preserved": [
+    "ECAPA, TitaNet and Pyannote verification",
+    "Speaker thresholds and corroboration rules",
+    "35-second default verification deadline",
+    "Gateway and controller workflow logic"
+  ],
+  "offline_checks": {
+    "decision_comparisons": 64,
+    "reference_cache": "exact-match reuse, changed-reference invalidation and bounded eviction passed",
+    "speaker_policy": "corroboration conditional and short-turn exception unchanged",
+    "worker_protocol": "progress forwarding, result parsing and timeout cleanup passed"
+  },
+  "syntax_checked_modules": 15,
+  "live_model_benchmark": "NOT YET PERFORMED; speed improvement is unverified",
+  "scope": "Submission copy only; no API calls, model downloads or database writes"
+}

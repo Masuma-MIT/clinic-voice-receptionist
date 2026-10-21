@@ -10,6 +10,7 @@ audio to Twilio as 8 kHz mu-law.
 """
 
 import asyncio
+from contextlib import aclosing
 import audioop
 import base64
 import html
@@ -32,11 +33,11 @@ from deepgram.core.events import EventType
 from aura2_tts_streaming import stream_aura2
 from call_session_registry import CallCapacityError, CallSessionRegistry
 from live_multimodel_verifier import LiveMultiModelVerifier
-from phone_turn_assembler import PhoneTurnAssembler
+from phone_turn_assembler import PhoneTurnAssembler, PhonePromptContext
 from phone_stt_monitor import SpeechListenerStopped, receive_phone_message
 from receptionist_controller_qwen37_experiment import create_receptionist_session
 from speaker_change_guard import SpeakerChangeGuard
-from speaker_audio_window import trim_speaker_edges
+from speaker_audio_window import trim_speaker_edges, TranscriptSpeakerAudio
 from voice_identity_store import VoiceIdentityStore
 
 
@@ -119,6 +120,7 @@ async def send_aura2_to_twilio(
     stream_sid: str,
     text: str,
     stream_provider=stream_aura2,
+    on_first_audio=None,
 ):
     """Send paced phone audio, retrying only before any audio was delivered."""
     phone_frame_bytes = TWILIO_FRAME_BYTES * 5  # 100 ms
@@ -134,38 +136,41 @@ async def send_aura2_to_twilio(
         first_audio_wait_ms = None
 
         try:
-            async for pcm24k in stream_provider(text):
-                pcm8k, rate_state = audioop.ratecv(
-                    pcm24k,
-                    2,
-                    1,
-                    24000,
-                    8000,
-                    rate_state,
-                )
-                pending.extend(audioop.lin2ulaw(pcm8k, 2))
-
-                while len(pending) >= phone_frame_bytes:
-                    frame = bytes(pending[:phone_frame_bytes])
-                    del pending[:phone_frame_bytes]
-                    await websocket.send_text(
-                        json.dumps(
-                            {
-                                "event": "media",
-                                "streamSid": stream_sid,
-                                "media": {
-                                    "payload": base64.b64encode(frame).decode("ascii"),
-                                },
-                            }
-                        )
+            async with aclosing(stream_provider(text)) as audio_stream:
+                async for pcm24k in audio_stream:
+                    pcm8k, rate_state = audioop.ratecv(
+                        pcm24k,
+                        2,
+                        1,
+                        24000,
+                        8000,
+                        rate_state,
                     )
-                    if first_audio_wait_ms is None:
-                        first_audio_wait_ms = round(
-                            (time.perf_counter() - attempt_started) * 1000,
-                            2,
+                    pending.extend(audioop.lin2ulaw(pcm8k, 2))
+    
+                    while len(pending) >= phone_frame_bytes:
+                        frame = bytes(pending[:phone_frame_bytes])
+                        del pending[:phone_frame_bytes]
+                        await websocket.send_text(
+                            json.dumps(
+                                {
+                                    "event": "media",
+                                    "streamSid": stream_sid,
+                                    "media": {
+                                        "payload": base64.b64encode(frame).decode("ascii"),
+                                    },
+                                }
+                            )
                         )
-                    frames_sent += 1
-                    await asyncio.sleep(0.10)
+                        if first_audio_wait_ms is None:
+                            first_audio_wait_ms = round(
+                                (time.perf_counter() - attempt_started) * 1000,
+                                2,
+                            )
+                        if frames_sent == 0 and on_first_audio is not None:
+                            on_first_audio()
+                        frames_sent += 1
+                        await asyncio.sleep(0.10)
 
             if pending:
                 frame = bytes(pending).ljust(phone_frame_bytes, b"\xff")
@@ -185,6 +190,8 @@ async def send_aura2_to_twilio(
                         (time.perf_counter() - attempt_started) * 1000,
                         2,
                     )
+                if frames_sent == 0 and on_first_audio is not None:
+                    on_first_audio()
                 frames_sent += 1
 
             return {
@@ -421,9 +428,10 @@ async def twilio_media_stream(websocket: WebSocket):
     deepgram = AsyncDeepgramClient(api_key=deepgram_key)
     stream_sid = None
     inbound_pcm16 = bytearray()
-    current_turn_pcm16 = bytearray()
+    speaker_audio_alignment = TranscriptSpeakerAudio()
     rate_state = None
     turn_assembler = PhoneTurnAssembler()
+    prompt_context = PhonePromptContext()
     turn_lock = asyncio.Lock()
     tts_lock = asyncio.Lock()
     silence_finalize_task = None
@@ -431,11 +439,11 @@ async def twilio_media_stream(websocket: WebSocket):
     speaking_task = None
     greeting_task = None
     turn_pending = False
-    queued_final_turns: list[tuple[str, bytes]] = []
+    queued_final_turns: list[tuple[str, bytes, str | None]] = []
     tts_playing = False
     tts_started_at = 0.0
     barge_in_in_progress = False
-    last_voiced_at = 0.0
+    last_transcript_at = 0.0
     closed = False
 
     write_call_evidence(
@@ -467,7 +475,11 @@ async def twilio_media_stream(websocket: WebSocket):
             tts_started_at = time.monotonic()
             write_call_evidence(evidence_path, "AI RESPONSE", [("Text", text)])
             try:
-                metrics = await send_aura2_to_twilio(websocket, stream_sid, text)
+                prompt_token = prompt_context.spoken_token(receptionist.session_state, text)
+                metrics = await send_aura2_to_twilio(
+                    websocket, stream_sid, text,
+                    on_first_audio=lambda: prompt_context.publish(len(inbound_pcm16)//2, prompt_token),
+                )
                 write_call_evidence(
                     evidence_path,
                     "TTS DELIVERY COMPLETE",
@@ -493,12 +505,40 @@ async def twilio_media_stream(websocket: WebSocket):
             finally:
                 tts_playing = False
 
-    async def process_completed_turn(transcript: str, speaker_pcm16: bytes):
+    async def process_completed_turn(transcript: str, speaker_pcm16: bytes, reply_to_prompt=None):
         nonlocal speaking_task
         transcript = transcript.strip()
         if not transcript:
             return
         async with turn_lock:
+            import re
+            from copy import deepcopy
+            active_prompt = prompt_context.token(receptionist.session_state)
+            normalized = receptionist._normalize_confirmation_text(transcript)
+            assent_only = (bool(normalized) and
+                set(normalized.split()) <= {'yes','yeah','yep','yup','please','book','it','confirm','correct','okay','ok','sure','that','this','is','s','right','go','ahead','i','do','perfect','fine','great','thank','thanks','you','all','good','sounds','proceed','confirmed','the','booking','appointment','certainly','absolutely','agreed','for','me'} and
+                any(word in normalized.split() for word in {'yes','yeah','yep','yup','correct','okay','ok','sure','confirm','book','perfect','fine','great','proceed','confirmed','agreed'}))
+            if assent_only and reply_to_prompt is not None and reply_to_prompt != active_prompt:
+                write_call_evidence(evidence_path, "STALE CONFIRMATION NOT REAPPLIED", [("Transcript", transcript)])
+                return
+            if assent_only and active_prompt is not None and reply_to_prompt != active_prompt:
+                # The caller spoke before this readback was sent. Do not turn an
+                # answer to an earlier question into permission for a new action.
+                write_call_evidence(evidence_path, "CONFIRMATION PRECEDES READBACK", [("Transcript", transcript)])
+                pending = receptionist.session_state.get("pending_action") or {}
+                flow = receptionist.session_state.get("nameflow_v1") or {}
+                if pending.get("action") == "book":
+                    await speak(receptionist._booking_confirmation_text_v1(pending.get("details") or pending.get("confirmation_details") or {}))
+                elif flow.get("stage") == "readback":
+                    await speak(receptionist._nameflow_readback(flow))
+                elif (receptionist.session_state.get('reference_flow_v2') or {}).get('simple_v6'):
+                    await speak(receptionist._management_prompt_v6() or "Please tell me the change you would like to make.")
+                else:
+                    await speak("Please confirm the exact details I read back, or tell me what you would like to change.")
+                return
+            management_before = deepcopy(receptionist.session_state.get('management_commit_v6'))
+            booking_before = deepcopy(receptionist.session_state.get('same_call_booking_v1'))
+            pending_before = deepcopy(receptionist.session_state.get('pending_action'))
             write_call_evidence(evidence_path, "PATIENT TURN RECEIVED", [("Transcript", transcript)])
             started = time.perf_counter()
             speaker_started = time.perf_counter()
@@ -577,6 +617,14 @@ async def twilio_media_stream(websocket: WebSocket):
                     except Exception as notice_error:
                         write_call_evidence(evidence_path, "PROCESSING NOTICE FAILED", [("Error type", type(notice_error).__name__)])
             response = await controller_task
+            booking_state = receptionist.session_state
+            write_call_evidence(evidence_path, "BOOKING STATE AFTER CONTROLLER", [
+                ("Selected slot", booking_state.get("selected_booking_v4")),
+                ("Verified name retained", bool(booking_state.get("verified_patient_name_key"))),
+                ("Name stage", (booking_state.get("nameflow_v1") or {}).get("stage")),
+                ("Pending transaction", booking_state.get("pending_action")),
+                ("Completed in this call", booking_state.get("same_call_booking_v1")),
+            ])
             controller_finished = time.perf_counter()
             logged_assessment = dict(speaker_assessment)
             if "returning_voice_candidate" in logged_assessment:
@@ -592,6 +640,16 @@ async def twilio_media_stream(websocket: WebSocket):
                     ("Response latency ms", round((time.perf_counter() - started) * 1000, 2)),
                 ],
             )
+            booking_created = (receptionist.session_state.get('same_call_booking_v1') != booking_before and
+                               bool(receptionist.session_state.get('same_call_booking_v1')))
+            management_completed = receptionist.session_state.get('management_commit_v6') != management_before
+            if queued_final_turns and not booking_created and not management_completed:
+                if receptionist.session_state.get('pending_action') != pending_before:
+                    receptionist.session_state['pending_action'] = None
+                if receptionist.messages and receptionist.messages[-1].get('role') == 'assistant' and receptionist.messages[-1].get('content') == response:
+                    receptionist.messages.pop()
+                write_call_evidence(evidence_path, "RESPONSE SUPERSEDED BEFORE PLAYBACK", [("Reason", "A newer completed caller turn is waiting")])
+                return
             speaking_task = asyncio.create_task(speak(response))
             try:
                 await speaking_task
@@ -605,14 +663,21 @@ async def twilio_media_stream(websocket: WebSocket):
                 speaking_task = None
 
     def dispatch_final_turn():
-        nonlocal current_turn_pcm16, active_turn_task, turn_pending
+        nonlocal active_turn_task, turn_pending
         transcript = turn_assembler.take()
-        speaker_snapshot = trim_speaker_edges(current_turn_pcm16)
-        current_turn_pcm16 = bytearray()
         if not transcript or closed:
             return
+        selected_audio, alignment = speaker_audio_alignment.take(inbound_pcm16)
+        speaker_snapshot = trim_speaker_edges(selected_audio)
+        reply_to_prompt = prompt_context.capture(alignment.get("first_word_start_seconds"))
+        write_call_evidence(evidence_path, "SPEAKER AUDIO ALIGNMENT", list(alignment.items()))
         if turn_pending:
-            queued_final_turns.append((transcript, speaker_snapshot))
+            import re
+            presence = re.sub(r"[^a-z ]", "", transcript.lower()).strip()
+            if presence in {"hello", "hello hello", "are you there", "hello are you there", "can you hear me"}:
+                write_call_evidence(evidence_path, "PRESENCE CHECK DURING PROCESSING", [("Transcript", transcript)])
+                return
+            queued_final_turns.append((transcript, speaker_snapshot, reply_to_prompt))
             write_call_evidence(
                 evidence_path,
                 "PHONE TURN QUEUED",
@@ -623,9 +688,9 @@ async def twilio_media_stream(websocket: WebSocket):
 
         async def run_one_turn():
             nonlocal turn_pending
-            async def guarded_turn(turn_text, turn_audio):
+            async def guarded_turn(turn_text, turn_audio, reply_prompt):
                 try:
-                    await process_completed_turn(turn_text, turn_audio)
+                    await process_completed_turn(turn_text, turn_audio, reply_prompt)
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:
@@ -642,10 +707,10 @@ async def twilio_media_stream(websocket: WebSocket):
                         except Exception as notice_error:
                             write_call_evidence(evidence_path, "TURN FAILURE NOTICE FAILED", [("Error type", type(notice_error).__name__)])
             try:
-                await guarded_turn(transcript, speaker_snapshot)
+                await guarded_turn(transcript, speaker_snapshot, reply_to_prompt)
                 while queued_final_turns and not closed:
-                    queued_transcript, queued_audio = queued_final_turns.pop(0)
-                    await guarded_turn(queued_transcript, queued_audio)
+                    queued_transcript, queued_audio, queued_prompt = queued_final_turns.pop(0)
+                    await guarded_turn(queued_transcript, queued_audio, queued_prompt)
             finally:
                 turn_pending = False
 
@@ -656,7 +721,6 @@ async def twilio_media_stream(websocket: WebSocket):
         if (
             barge_in_in_progress
             or not tts_playing
-            or (time.monotonic() - tts_started_at) < 0.8
         ):
             return
         barge_in_in_progress = True
@@ -717,6 +781,8 @@ async def twilio_media_stream(websocket: WebSocket):
         smart_format=True,
         punctuate=True,
         endpointing=700,
+        utterance_end_ms=1200,
+        vad_events=True,
     ) as dg_connection:
 
         if dg_connection is None:
@@ -728,29 +794,40 @@ async def twilio_media_stream(websocket: WebSocket):
             await release_session()
             return
 
-        async def finalize_after_silence(expected_voice_time: float):
-            # Twilio continues to send silence. Flush Deepgram in-call.
-            await asyncio.sleep(1.0)
-            if last_voiced_at != expected_voice_time:
-                return
-            await dg_connection.send_finalize()
-            await asyncio.sleep(0.25)
-            turn_assembler.schedule(dispatch_final_turn)
-
         def on_deepgram_message(message):
-            nonlocal silence_finalize_task
+            nonlocal silence_finalize_task, last_transcript_at
+            message_type = str(getattr(message, "type", ""))
+            if message_type == "SpeechStarted":
+                turn_assembler.caller_is_speaking()
+                return
+            if message_type == "UtteranceEnd":
+                turn_assembler.schedule(dispatch_final_turn)
+                return
             channel = getattr(message, "channel", None)
             alternatives = getattr(channel, "alternatives", None) if channel else None
             if not alternatives:
                 return
             transcript = str(getattr(alternatives[0], "transcript", "") or "").strip()
+            if transcript:
+                last_transcript_at = time.monotonic()
+                if silence_finalize_task is not None:
+                    silence_finalize_task.cancel()
+                    silence_finalize_task = None
+                if not bool(getattr(message, "is_final", False)):
+                    turn_assembler.caller_is_speaking()
+
             if transcript and tts_playing:
                 asyncio.create_task(
                     interrupt_tts_for_caller_speech(transcript)
                 )
             if transcript and bool(getattr(message, "is_final", False)):
                 write_call_evidence(evidence_path, "STT FINAL RECEIVED", [("Transcript", transcript)])
+                speaker_audio_alignment.add_final(alternatives[0])
                 turn_assembler.add_final(transcript)
+                # is_final describes stable words, not a finished utterance.
+                # A bounded fallback covers absent endpoint events without
+                # forcing the recogniser to finish an in-progress sentence.
+                turn_assembler.schedule(dispatch_final_turn, minimum_pause=3.0)
             if bool(getattr(message, "speech_final", False)):
                 if silence_finalize_task is not None:
                     silence_finalize_task.cancel()
@@ -791,17 +868,7 @@ async def twilio_media_stream(websocket: WebSocket):
                     mulaw_audio = base64.b64decode(payload)
                     pcm16_audio, rate_state = mulaw_8k_to_pcm16_16k(mulaw_audio, rate_state)
                     inbound_pcm16.extend(pcm16_audio)
-                    current_turn_pcm16.extend(pcm16_audio)
                     await dg_connection.send_media(pcm16_audio)
-                    rms = audioop.rms(pcm16_audio, 2)
-                    if rms >= 180:
-                        turn_assembler.caller_is_speaking()
-                        last_voiced_at = time.monotonic()
-                        if silence_finalize_task is not None:
-                            silence_finalize_task.cancel()
-                        silence_finalize_task = asyncio.create_task(
-                            finalize_after_silence(last_voiced_at)
-                        )
                     continue
 
                 if event == "stop":

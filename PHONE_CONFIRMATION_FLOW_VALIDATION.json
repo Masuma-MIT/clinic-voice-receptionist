@@ -1,0 +1,35 @@
+{
+  "update": "phone_native_utterance_and_prompt_causality_v1",
+  "installed_at": "2026-10-20T21:36:27.951925+11:00",
+  "observed_call": "20261020_201851_182205",
+  "observed_outcome": "The call log announced booking ID 4; no speaker-change claim. Repeated incomplete utterance processing and queued confirmations remained.",
+  "changes": [
+    "Remove interim-triggered forced Finalize; use native endpoint and UtteranceEnd events with a bounded fallback",
+    "Bind short assent to the actual prior transmitted readback using caller-word timestamps",
+    "Suppress superseded questions while retaining newer queued input and protecting booking success announcements",
+    "Recognised speech can interrupt TTS before first audio as well as during playback",
+    "Retain common explicit no-preference wording"
+  ],
+  "preserved": [
+    "Name and transaction verification",
+    "Speaker models and thresholds",
+    "Previous timing/cache/audio-alignment corrections",
+    "Original working project outside submission copy"
+  ],
+  "speaker_scope": "No new sex/gender classifier; speaker-change handling is acoustic assessment rather than patient authentication.",
+  "offline_checks": {
+    "controller_regressions": {
+      "reference_checks": 124,
+      "date_checks": 43,
+      "stability_checks": 44
+    },
+    "enquiry_regressions": 42,
+    "prompt_timeline": "uses caller word start, not late result arrival; changed slot changes confirmation token",
+    "turn_events": "stable fragments retained until an endpoint; interim speech cancels dispatch; UtteranceEnd handles absent speech_final; no forced Finalize calls",
+    "confirmation_causality": "current readback accepted; early assent blocked; completed/changed/name-stage assent not reapplied; corrections still processed",
+    "delivery_and_queue": "first-frame prompt marking, immediate recognised interruption, superseded-question suppression and booking-success delivery checked"
+  },
+  "syntax_checked_modules": 15,
+  "live_model_benchmark": "PENDING: complete telephone booking, genuine corrections, stale/repeated confirmations and interruptions. No guarantee of clinical reliability.",
+  "scope": "Submission copy only; no API calls, model downloads or database writes"
+}

@@ -1,0 +1,48 @@
+{
+  "update": "coordinated_receptionist_stability_v1",
+  "installed_at": "2026-10-20T20:04:25.625002+11:00",
+  "source_baseline": "15 modules supplied in receptionist_stability_review.zip",
+  "observed_problems": [
+    "Name-turn dispatch occurred about 40 seconds after last final transcript",
+    "Insured turn drew from a roughly 58-second elapsed audio buffer",
+    "Pyannote stages took roughly 18-19 seconds",
+    "Interrupted speech cleanup delayed the queued response by roughly 20 seconds"
+  ],
+  "changes": [
+    "Dispatch from final recognised speech and subsequent transcript activity, not raw-energy noise",
+    "Select speaker samples using final word timestamps",
+    "Skip Pyannote when unchanged embedding policy cannot propose a change",
+    "Explicitly close phone TTS generators and bound interrupted connection cleanup",
+    "Remove stale internal-state snapshots while retaining conversation and tool history",
+    "Retain explicit consultant and mode preferences",
+    "Restore mixed facility and clinic-hours question coverage",
+    "Use clear missing-certificate-detail questions after name confirmation"
+  ],
+  "preserved": [
+    "Speaker thresholds and corroboration rules",
+    "Name verification and explicit transaction confirmation",
+    "Complete input recordings and STT audio",
+    "Worker CPU and exact-reference cache update",
+    "Original working project outside submission copy"
+  ],
+  "speaker_scope": "Acoustic change assessment; no sex/gender classifier and no patient authentication. Male/female-only triggering has NOT been established.",
+  "offline_checks": {
+    "audio_alignment": "isolated replies, multiple segments, overlap, invalid timing and reset passed",
+    "gateway_queue": "queued transcript receives its own timestamp-selected audio; full input stream retained",
+    "decision_comparisons": 64,
+    "unnecessary_pyannote_calls_avoided_in_mock_cases": 36,
+    "tts": "normal delivery, cancelled wait, generator close and stalled provider-close checks passed with substitute sockets",
+    "controller_regressions": {
+      "reference_checks": 124,
+      "date_checks": 43,
+      "stability_checks": 44
+    },
+    "enquiry_regressions": 42,
+    "preference_continuity": "explicit choices retained; service boundaries and changed choices respected",
+    "long_history": "200 stale state snapshots removed; all conversation and tool-call messages preserved",
+    "stt_dispatch": "final results dispatch without speech_final; interim speech preserves spelling fragments; raw noise cannot cancel dispatch"
+  },
+  "syntax_checked_modules": 15,
+  "live_model_benchmark": "PENDING: complete browser and phone bookings, unchanged-caller calls, interruptions and genuine handovers. No claim of clinical deployment readiness.",
+  "scope": "Submission copy only; no API calls, model downloads or database writes"
+}

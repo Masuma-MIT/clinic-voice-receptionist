@@ -61,6 +61,10 @@ async def stream_aura2(
 
     ) as connection:
 
+        transport_socket = getattr(connection, "_websocket", None)
+        if transport_socket is not None and hasattr(transport_socket, "close_timeout"):
+            transport_socket.close_timeout = 0.5
+        interrupted = False
 
         def on_message(
             message
@@ -182,11 +186,20 @@ async def stream_aura2(
                     )
 
 
+        except (asyncio.CancelledError, GeneratorExit):
+            interrupted = True
+            # This connection belongs exclusively to this cancelled response.
+            transport = getattr(transport_socket, "transport", None)
+            if transport is not None and callable(getattr(transport, "abort", None)):
+                transport.abort()
+            raise
+
         finally:
 
             try:
 
-                await connection.send_close()
+                if not interrupted:
+                    await asyncio.wait_for(connection.send_close(), timeout=0.5)
 
             except Exception:
 
@@ -199,7 +212,7 @@ async def stream_aura2(
 
                 try:
 
-                    await listener_task
+                    await asyncio.wait_for(listener_task, timeout=0.5)
 
                 except asyncio.CancelledError:
 

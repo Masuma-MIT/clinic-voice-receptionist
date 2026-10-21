@@ -992,6 +992,8 @@ class ReceptionistSession:
         service_name,
         consultant_gender=None,
         consultation_mode=None,
+        appointment_date=None,
+        appointment_time=None,
     ):
 
         service = service_by_name.get(service_name)
@@ -1001,6 +1003,19 @@ class ReceptionistSession:
                 "reason": "Service is not available at this clinic.",
                 "service_name": service_name,
             }
+
+        # Explicit current arguments win. Reuse choices already supplied for
+        # this service when a later tool call omits them; never invent a choice.
+        request = self.session_state.get('public_request_v4') or {}
+        saved = self.session_state.get('availability_preferences_v1') or {}
+        if saved.get('service_name') != service_name:
+            saved = {}
+        if request.get('service_name') != service_name:
+            request = {}
+        if consultant_gender is None:
+            consultant_gender = request.get('consultant_gender') or saved.get('consultant_gender')
+        if consultation_mode is None:
+            consultation_mode = request.get('consultation_mode') or saved.get('consultation_mode')
 
         allowed_genders = {"female", "male", "no_preference"}
         allowed_modes = {"in_person", "video", "audio"}
@@ -1102,6 +1117,12 @@ class ReceptionistSession:
             .order("appointment_time")
             .limit(MAX_AVAILABILITY_ROWS_PER_QUERY)
         )
+        # Apply exact requested date/time in the database, BEFORE the row cap.
+        # A bounded broad list cannot prove that an unlisted time is unavailable.
+        if appointment_date:
+            slot_query = slot_query.eq("appointment_date", appointment_date)
+        if appointment_time:
+            slot_query = slot_query.eq("appointment_time", appointment_time)
         slot_response = slot_query.execute()
 
         available_slots = []
@@ -1124,6 +1145,11 @@ class ReceptionistSession:
             })
 
         self.session_state["active_service"] = service_name
+        self.session_state["availability_inventory_v5"] = {
+            "service_name": service_name, "consultant_gender": normalized_gender,
+            "consultation_mode": normalized_mode, "rows": [dict(row) for row in available_slots],
+            "query_date": appointment_date, "query_time": appointment_time,
+        }
         self.session_state["last_available_slots"] = available_slots
         return {
             "success": True,
@@ -2415,6 +2441,10 @@ class ReceptionistSession:
             ),
             None,
         )
+        if not matching_slot:
+            retained = self.session_state.get('selected_booking_v4') or {}
+            if retained.get('slot_id') == slot_id:
+                matching_slot = retained
         if not matching_slot:
             return {
                 "success": False,
@@ -3834,6 +3864,10 @@ class ReceptionistSession:
             self.session_state
         )
 
+        # Full server-side slot inventories are not language-model prompt history.
+        model_session_state.pop("availability_inventory_v5", None)
+        if model_session_state.get("booking_choice_pending_v5"):
+            model_session_state["booking_choice_pending_v5"] = model_session_state["booking_choice_pending_v5"][:5]
         model_session_state["last_available_slots"] = (
             self.session_state.get("last_available_slots")
             or []
@@ -3843,6 +3877,13 @@ class ReceptionistSession:
             self.session_state.get("last_found_appointments")
             or []
         )[:8]
+
+        # Superseded state is neither conversation history nor authorization.
+        # Keep real messages/tool results and replace only our own old snapshots.
+        self.messages[:] = [message for message in self.messages
+                            if not (message.get("role") == "system" and
+                                    str(message.get("content") or "").startswith(
+                                        "CURRENT INTERNAL SESSION STATE:\n"))]
 
         self.messages.append(
             {
@@ -4307,7 +4348,16 @@ class ReceptionistSession:
                 if result.get('requires_confirmation'):
                     details = result['confirmation_details']
                     return 'Thank you. ' + self._booking_confirmation_text_v1(details)
-                # Preserve missing certificate details and unavailable-slot errors.
+                # Ask for one missing item; already verified spelling stays verified.
+                if result.get('requires_medical_certificate_details'):
+                    questions = {
+                        'consultation mode': 'Would you like an in-person, video or audio appointment?',
+                        'medical insurance status': 'Do you have medical insurance?',
+                        'certificate purpose': 'What do you need the medical certificate for?',
+                        'requested certificate date range': 'What dates do you need the medical certificate to cover?',
+                    }
+                    missing = result.get('missing_fields') or []
+                    return 'Your name is confirmed. ' + (questions.get(missing[0], 'What remaining certificate details would you like to provide?') if missing else 'Please provide the remaining certificate details.')
                 return 'Your name and spelling are verified. ' + str(result.get('reason') or result.get('instruction') or 'Please provide the remaining appointment details.')
             return None
         groups = self._nameflow_groups(text)
@@ -4520,7 +4570,7 @@ class ReceptionistSession:
         normalized = self._normalize_confirmation_text(text)
         if self._is_explicit_rejection(text) or re.search(r'\b(?:but|wrong|incorrect|not|no|unsure)\b', normalized):
             return False
-        return (self._is_explicit_confirmation(text, 'name') or
+        return (self._short_assent_v5(text) or self._is_explicit_confirmation(text, 'name') or
                 bool(re.match(r'^(?:yes|yeah|yep|yup|okay|ok|correct|all good)(?:$| )', normalized)))
 
     def _nameflow_handle(self, text, flow):
@@ -4841,6 +4891,8 @@ class ReceptionistSession:
         # The atomic RPC remains the authority; never retry another slot automatically.
         self.session_state['pending_action'] = None
         self.session_state['selected_slot_id'] = None
+        self.session_state['selected_booking_v4'] = None
+        self.session_state['booking_choice_pending_v5'] = None
         self.session_state['nameflow_booking_arguments'] = None
         self.session_state['last_available_slots'] = []
         preferences = self.session_state.get('availability_preferences_v1')
@@ -4886,6 +4938,7 @@ class ReceptionistSession:
             return answer + ' Is there anything else I can help you with?'
         if result.get('requires_fresh_slot_selection'):
             slots = result.get('available_slots') or []
+            self.session_state['spoken_slot_options_v5'] = [dict(row) for row in slots[:3]]
             answer = 'That slot is no longer available.'
             if slots:
                 lines = [f"- {s['provider']} on {s['display_date']} at {s['display_time']}" for s in slots[:3]]
@@ -4925,6 +4978,7 @@ class ReceptionistSession:
                 result = self.book_appointment(confirmed=True, **arguments)
             except Exception:
                 self.session_state['pending_action'] = None
+                self.session_state['phone_result_uncertain_v4'] = True
                 answer = 'I could not confirm the booking result. Please check your appointment before trying again.'
                 self.messages.append({'role':'assistant','content':answer})
                 return answer
@@ -5855,7 +5909,8 @@ class ReceptionistSession:
     def _stable_snapshot_v4(self):
         from copy import deepcopy
         state = self.session_state
-        keys = ('active_service','last_available_slots','selected_slot_id',
+        keys = ('availability_inventory_v5','spoken_slot_options_v5','booking_filter_v5','booking_choice_pending_v5',
+                'active_service','last_available_slots','selected_slot_id',
                 'availability_preferences_v1','public_request_v4','selected_booking_v4',
                 'nameflow_v1','nameflow_booking_arguments','nameflow_booking_requested')
         draft = {key:deepcopy(state.get(key)) for key in keys}
@@ -5940,7 +5995,16 @@ class ReceptionistSession:
         date = self._stable_date_v4(text)
         if date:
             request['date'] = date
-        if re.search(r'\bno preferences?\b|\bany consultant\b',value):
+        preference = re.search(r'\b(?:prefer|want|need|would like) (?:a |an |the )?(female|male) (?:consultant|doctor|specialist)\b', value)
+        bare_preference = re.fullmatch(r'(?:a |the )?(female|male) (?:consultant|doctor|specialist)(?: please)?', value)
+        if preference or bare_preference:
+            request['consultant_gender'] = (preference or bare_preference)[1]
+        if re.search(r'\bmedical certificate\b', value):
+            request['service_name'] = 'Medical Certificate Consultation'
+        mode = re.fullmatch(r'(?:an? |the )?(audio|video|in person)(?: appointment| consultation)?(?: please)?', value)
+        if mode:
+            request['consultation_mode'] = mode[1].replace(' ', '_')
+        if re.search(r'\bno preferences?\b|\b(?:don t|do not) have (?:any |a )?preferences?\b|\b(?:either|any) (?:consultant|doctor|specialist)\b',value):
             request['consultant_gender'] = 'no_preference'
         self.session_state['public_request_v4'] = request
 
@@ -5965,7 +6029,12 @@ class ReceptionistSession:
             # A bounded availability list is not proof that a later date has no
             # slots. Let the existing model/tool path request more information.
             return None
-        self.session_state['last_available_slots'] = selected
+        # Spoken option numbering is separate from the complete retrieved rows.
+        self.session_state['spoken_slot_options_v5'] = [dict(row) for row in selected]
+        self.session_state['last_available_slots'] = [dict(row) for row in rows]
+        inventory = self.session_state.get('availability_inventory_v5') or {}
+        if not inventory or inventory.get('service_name') != tool_result.get('service_name'):
+            self.session_state['availability_inventory_v5'] = dict(service_name=tool_result.get('service_name'), rows=[dict(row) for row in rows])
         self.session_state['active_service'] = tool_result.get('service_name') or selected[0]['service_name']
         return ('Available '+str(self.session_state['active_service'])+' appointments on '+selected[0]['display_date']+': '+
                 ' '.join('Option '+str(i+1)+': '+s['provider']+' at '+s['display_time']+'.' for i,s in enumerate(selected))+
@@ -5991,7 +6060,8 @@ class ReceptionistSession:
         # A facility question mentioning "your clinic" must not become clinic hours.
         explicit_clinic_hours = bool(re.search(
             r'\b(?:clinic|hospital|reception) (?:opening hours|operating hours|business hours|hours)\b'
-            r'|\b(?:opening|operating|business) hours (?:of|for|at) (?:the |your )?(?:clinic|hospital|reception)\b', value))
+            r'|\b(?:opening|operating|business) hours (?:of|for|at) (?:the |your )?(?:clinic|hospital|reception)\b'
+            r'|\b(?:what time|when) (?:does|do|is) (?:the |your )?(?:clinic|hospital|reception) (?:open|opens|close|closes|opening|closing)\b', value))
         clinic_hours = explicit_clinic_hours or (not selected and bool(re.search(
             r'\b(?:clinic|hospital|reception) (?:open|opens|close|closes|opening|closing)\b', value)))
         generic_hours = bool(re.fullmatch(
@@ -6066,8 +6136,19 @@ class ReceptionistSession:
         name=self.session_state.get('verified_patient_name')
         arguments=dict(self.session_state.get('nameflow_booking_arguments') or {})
         arguments.update(patient_name=name or self.session_state.get('patient_name') or '',slot_id=selected['slot_id'])
+        if selected.get('service_name') == 'Medical Certificate Consultation':
+            arguments['consultation_mode'] = selected.get('consultation_mode')
         # Reuse real availability/name/confirmation gates and atomic booking RPC.
         result=self.book_appointment(confirmed=False,**arguments)
+        if result.get('requires_medical_certificate_details'):
+            questions = {
+                'consultation mode':'Would you like an in-person, video or audio appointment?',
+                'medical insurance status':'Do you have medical insurance?',
+                'certificate purpose':'What do you need the medical certificate for?',
+                'requested certificate date range':'What dates do you need the medical certificate to cover?',
+            }
+            missing = result.get('missing_fields') or []
+            return self._lookup_reply(text, questions.get(missing[0], 'Please provide the remaining certificate details.') if missing else 'Please provide the remaining certificate details.')
         if result.get('requires_confirmation'):
             return self._lookup_reply(text,self._booking_confirmation_text_v1(result['confirmation_details']))
         if result.get('requires_name_spelling') or self.session_state.get('nameflow_v1'):
@@ -6088,6 +6169,8 @@ class ReceptionistSession:
             self._handover_draft_v4=self._stable_snapshot_v4()
             self.session_state['public_request_v4']={}
             self.session_state['selected_booking_v4']=None
+            for key in ('availability_inventory_v5','spoken_slot_options_v5','booking_filter_v5','booking_choice_pending_v5'):
+                self.session_state.pop(key,None)
             if announced: assessment['possible_change']=True
             return self._stable_reference_turn_v4(text,assessment)
         verification=assessment.get('multimodel_verification') or {}
@@ -6155,6 +6238,13 @@ class ReceptionistSession:
         new_booking=bool(re.search(r'\b(?:first time|new booking|new appointment|no appointment id|no booking reference|do not have.*reference|don t have.*reference)\b',value))
         if not reference and not explicit_existing:
             self._stable_preferences_v4(text)
+        if not reference and not explicit_existing and self._reference_operation_v2(text) not in {'cancel','reschedule'}:
+            completed = self.session_state.get('same_call_booking_v1')
+            if completed and self._short_assent_v5(text):
+                return self._lookup_reply(text, 'Your appointment is already booked. The appointment ID is '+str(completed['appointment_id'])+'. Is there anything else I can help you with?')
+            draft_reply = self._booking_draft_turn_v5(text)
+            if draft_reply is not None:
+                return draft_reply
         if flow and not explicit_existing:
             return self._stable_dialogue_turn_v4(text,assessment)
         last_answer=next((str(m.get('content') or '') for m in reversed(self.messages) if m.get('role')=='assistant'),'').lower()
@@ -6190,7 +6280,7 @@ class ReceptionistSession:
             self.session_state['selected_slot_id']=picked['slot_id']
             return self._stable_prepare_selected_v4(text)
         operation=self._reference_operation_v2(text)
-        management=bool(reference or explicit_existing or
+        management=bool(reference or explicit_existing or operation in {'reschedule','cancel'} or
             (operation=='name' and not flow and not self.session_state.get('selected_booking_v4')) or
             (self.session_state.get('same_call_booking_v1') and operation in {'name','cancel','reschedule'}))
         if management and not new_booking:
@@ -6199,6 +6289,448 @@ class ReceptionistSession:
             result=self._confirmed_booking_turn_v1(text)
             if result is not None: return result
         return self._stable_dialogue_turn_v4(text,assessment)
+
+
+
+    def _short_assent_v5(self, text):
+        words = self._normalize_confirmation_text(text).split()
+        allowed = {'yes','yeah','yep','yup','ok','okay','sure','correct','confirm','confirmed',
+                   'perfect','fine','great','please','thank','thanks','you','that','this','is','s',
+                   'right','all','good','sounds','go','ahead','proceed','do','it','i','book',
+                   'the','booking','appointment','certainly','absolutely','agreed','for','me'}
+        positive = {'yes','yeah','yep','yup','ok','okay','sure','correct','confirm','confirmed',
+                    'perfect','fine','great','proceed','agreed'}
+        return bool(words and len(words)<=12 and set(words)<=allowed and set(words)&positive)
+
+    def _booking_options_v5(self, rows):
+        rows = [dict(row) for row in rows]
+        self.session_state['spoken_slot_options_v5'] = rows[:5]
+        if not rows:
+            return 'No matching appointments were returned by that database check. Would you like a different time or date?'
+        return ('The matching appointments are: '+ ' '.join(
+            'Option '+str(i+1)+': '+row['provider']+' on '+row['display_date']+' at '+row['display_time']+'.'
+            for i,row in enumerate(rows[:5]))+' Which would you prefer?')
+
+    def _booking_store_selection_v5(self, row):
+        from copy import deepcopy
+        old = self.session_state.get('selected_booking_v4') or {}
+        if old.get('slot_id') != row['slot_id']:
+            # A changed selection requires its own readback and later assent.
+            self.session_state['pending_action'] = None
+            saved = dict(self.session_state.get('nameflow_booking_arguments') or {})
+            saved.update(slot_id=row['slot_id'])
+            self.session_state['nameflow_booking_arguments'] = saved
+        self.session_state['booking_choice_pending_v5'] = None
+        self.session_state['selected_booking_v4'] = deepcopy(row)
+        self.session_state['selected_slot_id'] = row['slot_id']
+        self.session_state['booking_filter_v5'] = dict(date=row['appointment_date'],time=str(row['appointment_time'])[:5])
+        flow = self.session_state.get('nameflow_v1')
+        if flow:
+            flow['booking'] = dict(self.session_state.get('nameflow_booking_arguments') or {},slot_id=row['slot_id'])
+        self.messages.append({'role':'system','content':'Server retained the selected appointment draft: '+json.dumps(row,default=str)+
+            '. Do not replace this selection, restart availability, or request verified spelling unless the caller changes the request. This is not a completed booking.'})
+
+    def _booking_draft_turn_v5(self, text):
+        """Resolve explicit choices against database rows; keep the draft through spelling.
+
+        This runs only AFTER speaker/subject/write holds and outside existing-
+        appointment management. It never infers consent from a selection.
+        """
+        import re
+        state=self.session_state
+        inventory=state.get('availability_inventory_v5') or {}
+        if not inventory or state.get('same_call_booking_v1'):
+            return None
+        if state.get('speaker_change_pending') or state.get('speaker_hold_v2') or state.get('phone_result_uncertain_v4'):
+            return None
+        value=self._normalize_confirmation_text(text)
+        if re.search(r'\b(?:stop|never mind|do not book|don t book|cancel|reschedule|new patient|someone else)\b',value):
+            return None
+        service=inventory.get('service_name')
+        request=state.get('public_request_v4') or {}
+        if request.get('service_name') and request['service_name']!=service:
+            # A genuinely different service starts a new scheduling selection,
+            # while already confirmed name evidence remains governed separately.
+            for key in ('availability_inventory_v5','spoken_slot_options_v5','booking_filter_v5','selected_booking_v4','selected_slot_id','nameflow_booking_arguments','pending_action'):
+                state.pop(key,None)
+            return None
+        waiting_choices=state.get('booking_choice_pending_v5')
+        if waiting_choices and self._short_assent_v5(text):
+            return self._lookup_reply(text,self._booking_options_v5(waiting_choices))
+        if not re.search(r'\b(?:change|instead|different|prefer|want)\b',value) and state.get('pending_action') and self._short_assent_v5(text):
+            return self._confirmed_booking_turn_v1(text)
+        # Do not turn spelling or a name correction into a provider choice.
+        if self._nameflow_groups(text) or re.search(r'\b(?:spell|spelling|first name|last name|surname|patient s (?:full )?name)\b',value):
+            return None
+        rows=[dict(row) for row in inventory.get('rows',[]) if slot_is_in_future(row)]
+        date=self._stable_date_v4(text)
+        time_value=self._reference_time_v2(text)
+        context=dict(state.get('booking_filter_v5') or {})
+        provider_matches=[]
+        for row in rows:
+            tokens=[word for word in self._normalize_confirmation_text(row.get('provider','')).split() if len(word)>2 and word not in {'doctor'}]
+            if any(re.search(r'\b'+re.escape(word)+r'\b',value) for word in tokens):
+                provider_matches.append(row)
+        options=state.get('spoken_slot_options_v5') or []
+        ordinal={'first':1,'second':2,'third':3,'fourth':4,'fifth':5,'one':1,'two':2,'three':3,'four':4,'five':5}
+        choice=re.fullmatch(r'(?:okay |ok |yes )?(?:option |the )?(first|second|third|fourth|fifth|one|two|three|four|five|[1-5])(?: one| option)?(?: please)?',value)
+        if choice:
+            number=ordinal.get(choice[1]) or int(choice[1])
+            if number>len(options):
+                return self._lookup_reply(text,'Please choose one of the options I listed, or give your preferred doctor and time.')
+            row=options[number-1]
+            self._booking_store_selection_v5(row)
+            return self._stable_prepare_selected_v4(text)
+        # Exact database filters avoid treating the initial spoken five as all slots.
+        if date or time_value:
+            target_date=date or context.get('date') or request.get('date') or (rows[0]['appointment_date'] if rows else None)
+            target_time=time_value or context.get('time')
+            preferences=state.get('availability_preferences_v1') or {}
+            if preferences.get('service_name')!=service or not target_date:
+                return None
+            old_rows=list(state.get('last_available_slots') or [])
+            try:
+                fresh=self.check_service_availability(**preferences,appointment_date=target_date,
+                    appointment_time=(target_time+':00') if target_time else None)
+            except Exception:
+                state['last_available_slots']=old_rows
+                return self._lookup_reply(text,'I could not check that time just now. I have kept your selected appointment and verified name; no booking has been made by this check.')
+            if not fresh.get('success') or fresh.get('needs_clarification'):
+                return None
+            rows=fresh.get('available_slots') or []
+            state['booking_filter_v5']=dict(date=target_date,time=target_time)
+            if not rows:
+                # A failed search does not replace a selected slot or revoke a name.
+                state['last_available_slots']=old_rows
+                return self._lookup_reply(text,'The database returned no available '+service+' appointment on '+format_date(target_date)+
+                    (' at '+format_time(target_time+':00') if target_time else '')+'. Your previous selection has not been replaced. Would you like another time or date?')
+            named_ids={r['doctor_id'] for r in provider_matches}
+            if named_ids:
+                rows=[r for r in rows if r['doctor_id'] in named_ids]
+                if not rows:
+                    return self._lookup_reply(text,'That doctor was not returned for the requested time. Please choose another doctor or time; I have kept the verified name.')
+        elif provider_matches:
+            rows=provider_matches
+            if context.get('date'):
+                rows=[r for r in rows if r['appointment_date']==context['date']]
+            if context.get('time'):
+                rows=[r for r in rows if str(r['appointment_time'])[:5]==context['time']]
+        else:
+            # An unmatched provider choice is a clarification, never evidence
+            # that the real slot vanished. Keep the supplied name unchanged.
+            provider_choice = bool(re.search(r'\b(?:doctor|dr)\b',value) and re.search(r'\b(?:perfect|prefer|choose|take|book|fine)\b',value))
+            if provider_choice:
+                relevant=[row for row in rows if (not context.get('date') or row['appointment_date']==context['date']) and
+                          (not context.get('time') or str(row['appointment_time'])[:5]==context['time'])]
+                return self._lookup_reply(text, 'I could not match that doctor name to these retrieved appointments. '+self._booking_options_v5(relevant))
+            selected=state.get('selected_booking_v4')
+            reminder=bool(re.search(r'\b(?:already|don t repeat|do not repeat|continue|go ahead|proceed)\b',value))
+            if selected and reminder and not state.get('nameflow_v1'):
+                return self._stable_prepare_selected_v4(text)
+            return None
+        selecting=bool(provider_matches or re.search(r'\b(?:take|choose|select|prefer|book|perfect|fine|option|works|go for)\b',value))
+        if selecting and len(rows)>1:
+            state['pending_action']=None
+            state['booking_choice_pending_v5']=[dict(row) for row in rows]
+        if len(rows)==1 and selecting:
+            self._booking_store_selection_v5(rows[0])
+            return self._stable_prepare_selected_v4(text)
+        return self._lookup_reply(text,self._booking_options_v5(rows))
+
+
+    # Reference-based management for this administrative demonstration.
+    # Matching an appointment reference is not patient authentication.
+    simple_management_enabled_v6 = True
+    _management_reference_before_v6 = _reference_turn_v2
+    _management_operation_before_v6 = _reference_operation_v2
+
+    def _reference_operation_v2(self, text):
+        import re
+        value = self._normalize_confirmation_text(text)
+        if self.simple_management_enabled_v6:
+            if re.search(r'\b(?:reschedule|re schedule)\b', value):
+                return 'reschedule'
+        return self._management_operation_before_v6(text)
+
+    _management_id_before_v6 = _reference_id_v2
+
+    def _reference_id_v2(self, text, bare=False):
+        result = self._management_id_before_v6(text,bare)
+        if result is None and self.simple_management_enabled_v6:
+            # Spoken numbers in an explicit reference phrase, not dates or times.
+            converted = self._reference_number_text_v3(text)
+            result = self._management_id_before_v6(converted,bare)
+        return result
+
+    _management_commit_before_v6 = _reference_commit_v2
+
+    def _reference_commit_v2(self, flow):
+        if not flow.get('simple_v6'):
+            return self._management_commit_before_v6(flow)
+        operation = flow.get('operation')
+        answer = self._management_commit_before_v6(flow)
+        record = flow.get('record') or {}
+        if (flow.get('stage') == 'ready' and flow.get('operation') == 'details' and
+                self.session_state.get('reference_verified_v2') == record and
+                operation in {'cancel','reschedule'}):
+            self.session_state['management_commit_v6'] = {
+                'sequence': (self.session_state.get('management_commit_v6') or {}).get('sequence',0)+1,
+                'action': operation, 'appointment_id': record['appointment_id'],
+                'slot_id': record['slot_id'], 'status': record['status']}
+        return answer
+
+    def _management_prompt_v6(self):
+        flow = self.session_state.get('reference_flow_v2') or {}
+        if not flow.get('simple_v6') or not flow.get('record'):
+            return None
+        record = flow['record']
+        if flow['stage'] == 'confirm_cancel':
+            return self._reference_summary_v2(record) + '. Do you confirm cancelling this appointment?'
+        if flow['stage'] == 'confirm_reschedule' and flow.get('selected'):
+            slot = flow['selected']
+            return ('Do you confirm moving appointment ' + str(record['appointment_id']) +
+                    ' for ' + record['patient_name'] + ' with ' + record['provider'] +
+                    ' from ' + record['display_date'] + ' at ' + record['display_time'] +
+                    ' to ' + slot['display_date'] + ' at ' + slot['display_time'] + '?')
+        return None
+
+    def _management_prepare_v6(self, flow, selected=None):
+        self.session_state['pending_action'] = None
+        if selected is None:
+            result = self.cancel_appointment(flow['record']['appointment_id'], confirmed=False)
+            stage = 'confirm_cancel'
+        else:
+            self.session_state['last_available_slots'] = [dict(selected)]
+            result = self.reschedule_appointment(flow['record']['appointment_id'], selected['slot_id'], confirmed=False)
+            stage = 'confirm_reschedule'
+        if not isinstance(result, dict) or not result.get('requires_confirmation'):
+            flow['stage'] = 'preference' if selected else 'ready'
+            return str((result or {}).get('reason') or 'I could not prepare that change. Your existing appointment is unchanged.')
+        flow['stage'] = stage
+        if selected is not None:
+            flow['selected'] = dict(selected)
+        return self._management_prompt_v6()
+
+    def _management_date_v6(self, text, flow):
+        import re
+        from datetime import date, timedelta
+        value = self._normalize_confirmation_text(text)
+        if re.search(r'\b(?:same|original|current|existing) (?:day|date)\b', value):
+            return flow['record']['appointment_date']
+        full = self._reference_date_v2(text)
+        if full:
+            return full
+        parts = self._reference_date_parts_v3(text)
+        if 'day' in parts and 'month' in parts:
+            year = parts.get('year', sydney_now().year)
+            try:
+                return date(year, parts['month'], parts['day']).isoformat()
+            except ValueError:
+                return 'invalid'
+        match = re.search(r'\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b', value)
+        if match:
+            today = sydney_now().date()
+            weekday = ['monday','tuesday','wednesday','thursday','friday','saturday','sunday'].index(match[1])
+            delta = (weekday-today.weekday()) % 7
+            if delta == 0 and 'next' in value:
+                delta = 7
+            return (today+timedelta(days=delta)).isoformat()
+        return None
+
+    def _management_offer_v6(self, text, flow):
+        import re
+        value = self._normalize_confirmation_text(text)
+        record = flow['record']
+        # Prefer the requested new time over a preceding description of the old time.
+        target = re.split(r'\b(?:so|instead|rather|change (?:it )?to|move (?:it )?to)\b', str(text).lower())[-1]
+        date = self._management_date_v6(target, flow) or self._management_date_v6(text, flow)
+        time = self._reference_time_v2(target)
+        if time is None and target != str(text).lower():
+            # Never fall back to an old time when the new clause contains a time.
+            time = self._reference_time_v2(text) if not re.search(r'\d|\bam\b|\bpm\b',target) else None
+        next_available = bool(re.search(r'\b(?:next available|earliest|any date|another day)\b', value))
+        same_day = bool(re.search(r'\b(?:same|original|current|existing) (?:day|date)\b',value))
+        if date == 'invalid':
+            return 'That date is not valid. What date would you prefer?'
+        # A bare time means a time-only change on the retained booked date.
+        if time and not date:
+            date = flow.get('requested_date') or record['appointment_date']
+        if not date and same_day:
+            date = record['appointment_date']
+        if not date and not next_available:
+            flow['stage'] = 'preference'
+            return 'What new date or time would you prefer? You can say, for example, 1 PM on the same date, tomorrow, or next available with the same doctor.'
+        if date and date < sydney_now().date().isoformat():
+            return 'That date has passed. What future date would you prefer?'
+        # Clear an old proposed change before searching for a different one.
+        self.session_state['pending_action'] = None
+        flow.pop('selected',None)
+        flow.update(stage='preference', requested_date=date)
+        try:
+            service = next(s for s in service_by_id.values() if s['service_name']==record['service_name'])
+            query = (supabase.table('slots')
+                .select('slot_id,doctor_id,service_id,appointment_date,appointment_time,available,consultation_mode')
+                .eq('doctor_id',record['doctor_id']).eq('service_id',service['service_id'])
+                .eq('consultation_mode',record['consultation_mode']).eq('available',True))
+            query = query.eq('appointment_date',date) if date else query.gte('appointment_date',sydney_now().date().isoformat())
+            # Filter the requested time in SQL before applying the bounded limit.
+            if time:
+                query = query.eq('appointment_time',time+':00')
+            rows = query.order('appointment_date').order('appointment_time').limit(50).execute().data or []
+            slots=[]; seen=set()
+            for row in rows:
+                if not slot_is_in_future(row) or row['slot_id']==record['slot_id']:
+                    continue
+                if next_available and same_day and str(row['appointment_time'])[:5] <= record['appointment_time'][:5]:
+                    continue
+                if row['slot_id'] in seen:
+                    continue
+                seen.add(row['slot_id'])
+                slots.append(dict(row,provider=record['provider'],service_name=record['service_name'],
+                    display_date=format_date(row['appointment_date']),display_time=format_time(row['appointment_time'])))
+                if len(slots)==5:
+                    break
+        except Exception:
+            return 'I could not check availability just now. Your existing appointment is unchanged. Please try your preferred date or time again.'
+        if not slots:
+            flow['slots']=[]
+            if time and date==record['appointment_date'] and time==record['appointment_time'][:5]:
+                return 'That is your existing appointment time. What different time would you prefer?'
+            return ('I found no matching available slot with '+record['provider']+
+                    (' on '+format_date(date) if date else '')+
+                    ( ' at '+format_time(time+':00') if time else '')+
+                    '. Your current booking is unchanged. Would you like another time or date with the same doctor?')
+        flow['slots']=slots
+        self.session_state['last_available_slots']=slots
+        if len(slots)==1:
+            return self._management_prepare_v6(flow,slots[0])
+        flow['stage']='choose_slot'
+        return self._management_options_v6(flow)
+
+    def _management_options_v6(self, flow):
+        slots=flow.get('slots') or []
+        if not slots:
+            return 'What new date or time would you prefer with the same doctor?'
+        return ('With '+flow['record']['provider']+', I can offer: '+
+                ' '.join('Option '+str(i+1)+': '+s['display_date']+' at '+s['display_time']+'.' for i,s in enumerate(slots))+
+                ' You can say the time or the option number, or ask for a different date.')
+
+    def _reference_turn_v2(self, text):
+        import re
+        if not self.simple_management_enabled_v6:
+            return self._management_reference_before_v6(text)
+        value=self._normalize_confirmation_text(text)
+        operation=self._reference_operation_v2(text)
+        flow=self.session_state.get('reference_flow_v2')
+        if not (flow and flow.get('simple_v6')) and operation not in {'cancel','reschedule'}:
+            return self._management_reference_before_v6(text)
+        if value in {'stop','stop please','never mind','cancel this request','do not update','don t update','goodbye','bye'}:
+            self._reference_clear_v2()
+            return self._lookup_reply(text,'I have stopped this request. No further change will be made.')
+        gate=self._handover_subject_gate_v1()
+        if gate or self.session_state.get('speaker_hold_v2') or self.session_state.get('phone_result_uncertain_v4'):
+            return self._lookup_reply(text,gate['reason'] if gate else 'Please resolve the current booking or speaker check before making a change.')
+        if operation=='name':
+            self._reference_clear_v2()
+            return self._management_reference_before_v6(text)
+        requested_id=self._reference_id_v2(text,bare=bool(flow and flow.get('stage')=='reference'))
+        if not flow or not flow.get('simple_v6'):
+            previous=flow or {}
+            known=previous.get('record') if previous.get('stage') not in {'reference','verify_details','confirm_record'} else None
+            known=known or self.session_state.get('same_call_booking_v1')
+            self._reference_clear_v2()
+            flow={'simple_v6':True,'stage':'reference','operation':operation or 'reschedule','slots':[]}
+            self.session_state['reference_flow_v2']=flow
+            if requested_id is None and known and not re.search(r'\b(?:another|different|previous|earlier)\b',value):
+                requested_id=known['appointment_id']
+        elif operation in {'cancel','reschedule'} and operation!=flow['operation']:
+            flow.update(operation=operation,stage='preference',slots=[])
+            flow.pop('selected',None)
+            self.session_state['pending_action']=None
+        record=flow.get('record')
+        if requested_id is not None and (record is None or requested_id!=record['appointment_id']):
+            op=flow['operation']
+            self._reference_clear_v2()
+            flow={'simple_v6':True,'stage':'reference','operation':op,'slots':[]}
+            self.session_state['reference_flow_v2']=flow
+            try:
+                record=self._reference_record_v2(requested_id)
+            except Exception:
+                return self._lookup_reply(text,'I could not check that appointment ID just now. Please try it again.')
+            if not record:
+                return self._lookup_reply(text,'I could not find that appointment ID. Please check the appointment number and try again.')
+            if record['status']!='booked':
+                flow.update(stage='ready',record=record)
+                return self._lookup_reply(text,'Appointment '+str(requested_id)+' is '+str(record['status'])+' and cannot be changed as a current booking.')
+            flow.update(stage='preference',record=record)
+            self._reference_activate_v2(record)
+            if flow['operation']=='cancel':
+                return self._lookup_reply(text,self._management_prepare_v6(flow))
+            # Do not mistake a time in the introduction for a new time; an explicit
+            # new preference can be supplied on the same turn as the reference.
+            if re.search(r'\b(?:tomorrow|today|next available|same date|same day|to \d|at \d)\b',value):
+                return self._lookup_reply(text,self._management_offer_v6(text,flow))
+            return self._lookup_reply(text,self._reference_summary_v2(record)+'. What new date or time would you prefer? I will keep the same doctor.')
+        if record is None:
+            return self._lookup_reply(text,'What is your appointment ID or booking reference? I can retrieve the saved booking without asking you to spell your name again.')
+        if record['status']!='booked':
+            return self._lookup_reply(text,'Appointment '+str(record['appointment_id'])+' is '+str(record['status'])+'. No further change was made.')
+        if flow['stage']=='result_pending':
+            return self._lookup_reply(text,'The change result needs checking. I will not submit it again automatically.')
+        if flow['operation']=='cancel':
+            if flow['stage']=='confirm_cancel' and self._short_assent_v5(text):
+                if not self.session_state.get('pending_action'):
+                    return self._lookup_reply(text,self._management_prepare_v6(flow))
+                return self._lookup_reply(text,self._reference_commit_v2(flow))
+            if self._is_explicit_rejection(text):
+                self.session_state['pending_action']=None
+                flow.update(stage='ready',operation='details')
+                return self._lookup_reply(text,'I have not cancelled your appointment. It remains booked.')
+            return self._lookup_reply(text,self._management_prepare_v6(flow))
+        if flow['stage']=='confirm_reschedule' and self._short_assent_v5(text):
+            if not self.session_state.get('pending_action'):
+                return self._lookup_reply(text,self._management_prepare_v6(flow,flow['selected']))
+            return self._lookup_reply(text,self._reference_commit_v2(flow))
+        if flow['stage']=='ready' and operation not in {'reschedule','cancel'}:
+            if self._short_assent_v5(text):
+                return self._lookup_reply(text,'That request has already been completed. Is there anything else I can help with?')
+            return None
+        if flow['stage']=='confirm_reschedule' and self._is_explicit_rejection(text):
+            self.session_state['pending_action']=None
+            flow.update(stage='preference',slots=[])
+            flow.pop('selected',None)
+            return self._lookup_reply(text,'I have not moved the appointment. What different date or time would you prefer?')
+        # An ordinal selects an offered slot; repeating the same ordinal is okay.
+        words={'one':1,'first':1,'two':2,'second':2,'three':3,'third':3,'four':4,'fourth':4,'five':5,'fifth':5}
+        numbers=[]
+        for match in re.finditer(r'\b(?:option|number)\s+(one|two|three|four|five|[1-5])\b|\b(first|second|third|fourth|fifth)\b',value):
+            word=match[1] or match[2]; numbers.append(words.get(word) or int(word))
+        if re.fullmatch(r'(?:one|two|three|four|five|[1-5])(?: please)?',value):
+            word=value.split()[0];numbers=[words.get(word) or int(word)]
+        date=self._management_date_v6(text,flow)
+        timing=bool(re.search(r'\b(?:am|pm|morning|afternoon|evening|next available|same date|same day|tomorrow|today)\b',self._reference_number_text_v3(text)) or date)
+        if numbers and not timing:
+            if re.search(r'\b(?:not|no|except|instead|but)\b',value):
+                self.session_state['pending_action']=None
+                flow['stage']='choose_slot'
+                return self._lookup_reply(text,'Please tell me which time you would like instead. '+self._management_options_v6(flow))
+            if len(set(numbers))==1 and numbers[0]<=len(flow.get('slots') or []):
+                return self._lookup_reply(text,self._management_prepare_v6(flow,flow['slots'][numbers[0]-1]))
+            return self._lookup_reply(text,'Please choose one of the available times. '+self._management_options_v6(flow))
+        if timing:
+            return self._lookup_reply(text,self._management_offer_v6(text,flow))
+        if flow['stage']=='confirm_reschedule' and re.search(r'\b(?:different|change|instead|another|rather|but)\b',value):
+            self.session_state['pending_action']=None
+            flow.update(stage='preference',slots=[])
+            flow.pop('selected',None)
+            return self._lookup_reply(text,'I have not moved the appointment. What date or time would you like instead?')
+        if flow['stage'] in {'confirm_cancel','confirm_reschedule'}:
+            # Repeated action requests are not assent; replay the exact readback.
+            if not self.session_state.get('pending_action'):
+                return self._lookup_reply(text,self._management_prepare_v6(flow,flow.get('selected')))
+            return self._lookup_reply(text,self._management_prompt_v6())
+        return self._lookup_reply(text,self._management_options_v6(flow))
+
 
 
 # ============================================================
