@@ -22,3 +22,19 @@ FOLLOW-UP SUBMISSION-COPY CHECKS (14 October 2026):
 - A partial-answer observation prompted an enquiry-coverage repair; its installer reported 42 passing offline enquiry cases and 15/15 source syntax checks.
 - No further telephone call was performed after that enquiry repair.
 These follow-up checks do not establish independent installation or comprehensive end-to-end performance on another computer.
+
+
+ORIGINAL-PROJECT CONSOLIDATION (21 October 2026)
+Evidence: user-supplied live Supabase verification and local connection-helper output.
+Merge complete: true. Original appointments preserved: 20. Newer appointments imported: 4.
+Certificate requests imported: 2. Final counts: 24 appointments, 22,366 slots, 10 history records.
+Reference counts unchanged: 13 services, 65 doctors, 67 doctor-service mappings, 19 knowledge records.
+Both appointment triggers enabled; checked appointment, slot and certificate application permissions true.
+Original slot definitions retained for 43 consultation-mode conflicts. One conflicting historical definition and two historical references preserved in a private archive within the original project.
+A rescheduled imported appointment retained its current slot, reschedule_count of 1, last_action and last_rescheduled_at.
+Read-only API checks verified all four migrated bookings before the updated local application configuration switched to the original project.
+Configuration backup created; browser and telephone share the original database after restart. Application source, other API settings and tunnel settings unchanged by this switch.
+Telephone gateway startup and public preflight passed after the switch. A complete live appointment operation after consolidation remains pending verification.
+The former separate project is no longer configured for application operation; its deletion has not been confirmed.
+Historical validation sections above describe earlier stages, not the current database connection.
+Private snapshots, credentials and migration payloads remain excluded from this public repository.

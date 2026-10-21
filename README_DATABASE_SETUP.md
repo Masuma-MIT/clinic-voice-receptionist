@@ -1,6 +1,14 @@
-# Supervisor demonstration database setup
+# Database configuration and optional independent setup
 
-This package accompanies both the browser and Twilio source in the clinic-voice-receptionist repository. It prepares a separate demonstration database for that source. It must be installed in a new, empty Supabase project using the SQL Editor as the project database administrator. Do not run these scripts in the working research database.
+## Current maintained system
+
+The updated browser and Twilio applications now share the original research Supabase project, with its existing project name retained. Four newer appointments, their history and two certificate requests were consolidated into that project while preserving all 20 original appointments. Supplied verification confirmed 24 appointments, 22,366 slots and 10 history records; both appointment triggers were enabled and the checked application permissions were present. The local connection switch completed with a private configuration backup. Telephone gateway startup and public preflight passed after the switch; a complete live appointment operation against the consolidated database is still pending.
+
+The former separate demonstration project is no longer configured as the application database. Its deletion has not been confirmed. Private migration archives remain inside the original project and are not public repository contents. See the consolidation entry in `DATABASE_SETUP_VALIDATION.txt` for the conflict policy and evidence boundaries.
+
+## Optional independent reviewer setup
+
+The scripts below prepare a separate empty database only for independent installation. They are not needed to operate the existing original project and must not be run against it. Use a new, empty Supabase project and run them as the project database administrator.
 
 ## Installation order
 

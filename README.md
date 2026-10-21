@@ -29,7 +29,7 @@ These files record installed versions; installation and compatibility must be ch
 ## Configuration
 Copy .env.example to .env locally and provide authorised Deepgram, Qwen and Supabase settings.
 Credentials, recordings, private profiles, model caches and virtual environments are excluded from Git.
-A matching Supabase schema, appointment functions and demonstration data are required; source code alone does not provision the database.
+A matching Supabase schema, appointment functions and clinic reference data are required; source code alone does not provision the database. The maintained application now uses one original Supabase project for both browser and telephone interactions. See the database guide for the distinction between this active database and optional independent setup.
 
 ## Browser demonstration
 Create a .venv environment and install requirements_main.txt.
@@ -57,7 +57,7 @@ Model weights and account tokens are not included in this repository.
 The system supports administrative enquiries and appointment workflows, not personalised diagnosis or treatment advice.
 Speaker clarification is not patient authentication.
 The thesis reports browser, telephone, automated, acoustic and regression evidence with their respective evaluation boundaries.
-This source package does not currently include participant recordings or test reports.
+Participant recordings and private database snapshots are excluded. The repository includes scoped validation notes for application repairs; these do not establish comprehensive end-to-end performance.
 
 ## Review status
 The 15 submitted Python modules passed static syntax checks during packaging.
@@ -68,5 +68,15 @@ This does not establish successful installation or a live demonstration on a dif
 This repository contains the browser and Twilio implementations, demonstration database scripts, and setup instructions. Credentials are excluded from the public repository. Running the system requires authorised API credentials and the configuration described in the setup guides. Assistance with execution can be arranged if further verification is required.
 
 - [Professor access guide — Word document](docs/Professor_AI_Receptionist_Access_Guide.docx)
-- [Demonstration database setup](README_DATABASE_SETUP.md)
+- [Database configuration and optional independent setup](README_DATABASE_SETUP.md)
 - [Speaker-model setup](README_SPEAKER_SETUP.md)
+
+## Shared active database
+
+The updated browser and Twilio implementations are configured locally to use the original research Supabase project, retaining its existing name. The previously separate demonstration database is no longer the configured application database. Both interfaces share the same appointment records after restart.
+
+On 21 October 2026, supplied verification output confirmed preservation of 20 original appointments, import of four newer appointments and two certificate requests, and totals of 24 appointments, 22,366 slots and 10 appointment-history entries. Reference counts remained 13 services, 65 doctors, 67 doctor-service mappings and 19 clinic-knowledge records. These are operational counts at consolidation, not replacements for historical thesis measurements.
+
+Both appointment triggers and the checked server-side application permissions were verified. The local connection helper confirmed the four migrated bookings through read-only API checks, backed up configuration and switched the updated application to the original project. Telephone startup and public preflight subsequently passed. A complete live appointment operation after this switch remains pending verification.
+
+The consolidation preserved original slot definitions for 43 consultation-mode conflicts. One conflicting historical slot definition and two historical references were retained in a private archive within the original project. Application source was unchanged. Credentials, private records and migration payloads are not included here. The optional setup scripts remain available for reviewers who need their own empty database; the maintained system does not require a second active project.
