@@ -21,6 +21,7 @@ from receptionist_controller_qwen37_experiment import create_receptionist_sessio
 from aura2_tts_streaming import stream_aura2
 from conversation_audio_mixer import save_whole_conversation_wav
 from speaker_change_guard import SpeakerChangeGuard
+from phone_turn_assembler import PhonePromptContext
 
 
 # ============================================================
@@ -453,6 +454,8 @@ let ttsPlaybackGeneration = 0;
 let currentTtsServerGeneration = null;
 let currentLatencyTurnId = null;
 let ttsPlaybackAckSent = false;
+let ttsStreamEnded = false;
+let ttsDrainAckSent = false;
 
 const TTS_SAMPLE_RATE = 24000;
 
@@ -461,7 +464,19 @@ const TTS_SAMPLE_RATE = 24000;
 // DEEPGRAM AURA-2 PCM AUDIO PLAYER
 // ============================================================
 
+function notifyAura2PlaybackEnded() {
+    if (!ttsStreamEnded || aura2Sources.size !== 0 || ttsDrainAckSent || currentTtsServerGeneration === null) return;
+    ttsDrainAckSent = true;
+    isAISpeaking = false;
+    document.getElementById("aiVoiceStatus").innerText = "Ready for patient";
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({type:"tts_playback_ended", generation:currentTtsServerGeneration}));
+    }
+}
+
 function stopAura2Playback() {
+    ttsStreamEnded = false;
+    ttsDrainAckSent = false;
 
     ttsPlaybackGeneration += 1;
 
@@ -518,7 +533,8 @@ function stopAura2Playback() {
 async function playAura2PCM(arrayBuffer) {
 
     if (
-        !arrayBuffer
+        currentTtsServerGeneration === null
+        || !arrayBuffer
         || arrayBuffer.byteLength < 2
     ) {
 
@@ -654,6 +670,7 @@ async function playAura2PCM(arrayBuffer) {
 
             if (
                 aura2Sources.size === 0
+                && ttsStreamEnded
             ) {
 
                 isAISpeaking =
@@ -669,6 +686,7 @@ async function playAura2PCM(arrayBuffer) {
                 ).innerText =
                     "Ready for patient";
             }
+            notifyAura2PlaybackEnded();
         };
 
 
@@ -1016,8 +1034,10 @@ async function startConversation() {
         // RECEIVE FASTAPI RESULTS
         // ----------------------------------------------------
 
+        const conversationSocket = ws;
         ws.onmessage =
             async function(event) {
+                if (ws !== conversationSocket) return;
 
                 if (
                     event.data
@@ -1091,6 +1111,7 @@ async function startConversation() {
 
                 if (
                     data.type === "tts_stop"
+                    && (data.generation === undefined || data.generation === currentTtsServerGeneration)
                 ) {
 
                     stopAura2Playback();
@@ -1115,18 +1136,9 @@ async function startConversation() {
                 }
 
 
-                if (
-                    data.type === "tts_end"
-                    && aura2Sources.size === 0
-                ) {
-
-                    isAISpeaking =
-                        false;
-
-                    document.getElementById(
-                        "aiVoiceStatus"
-                    ).innerText =
-                        "Ready for patient";
+                if (data.type === "tts_end" && data.generation === currentTtsServerGeneration) {
+                    ttsStreamEnded = true;
+                    notifyAura2PlaybackEnded();
                 }
 
 
@@ -1149,7 +1161,7 @@ async function startConversation() {
                         document.getElementById(
                             "vadStatus"
                         ).innerText =
-                            "ðŸŸ¢ SPEECH DETECTED";
+                            "SPEECH DETECTED";
                     }
 
 
@@ -1257,10 +1269,14 @@ async function startConversation() {
 
         ws.onclose =
             function() {
+                if (ws !== conversationSocket) return;
 
-                console.log(
-                    "FastAPI WebSocket closed"
-                );
+                stopAura2Playback();
+                if (audioStream) audioStream.getTracks().forEach(track => track.stop());
+                document.getElementById("status").innerText = "Connection closed. Start a new conversation to reconnect.";
+                document.getElementById("startButton").disabled = false;
+                document.getElementById("stopButton").disabled = true;
+                console.log("FastAPI WebSocket closed");
             };
 
 
@@ -1499,7 +1515,7 @@ async function startConversation() {
         document.getElementById(
             "status"
         ).innerText =
-            "ðŸŽ¤ Live microphone active";
+            "Live microphone active";
 
 
         document.getElementById(
@@ -2006,8 +2022,13 @@ async def websocket_endpoint(
         "generation": 0,
         "active": False,
         "text": "",
+        "sending_complete": False,
+        "prompt_token": None,
     }
 
+
+    browser_prompt_context = PhonePromptContext()
+    caller_activity = {"speaking": False}
 
     interruption_state = {
         "suppress_command_until_final": False,
@@ -2544,6 +2565,9 @@ async def websocket_endpoint(
             return
 
 
+        if generation != tts_state["generation"] or not tts_state.get("active"):
+            return
+        browser_prompt_context.publish(int(time.perf_counter()*16000), tts_state.get("prompt_token"))
         ai_segment = whole_audio_state[
             "ai_segments"
         ].get(generation)
@@ -2751,6 +2775,8 @@ async def websocket_endpoint(
 
             tts_state["active"] = True
             tts_state["text"] = voice_text
+            tts_state["sending_complete"] = False
+            tts_state["prompt_token"] = browser_prompt_context.spoken_token(receptionist.session_state, voice_text)
 
             await send_json_to_browser(
                 {
@@ -2873,8 +2899,10 @@ async def websocket_endpoint(
                 == tts_state["generation"]
             ):
 
-                tts_state["active"] = False
-                tts_state["text"] = ""
+                tts_state["sending_complete"] = completed
+                if not completed:
+                    tts_state["active"] = False
+                    tts_state["text"] = ""
 
                 if (
                     tts_state["task"]
@@ -2945,6 +2973,8 @@ async def websocket_endpoint(
                 )
             )
         )
+        if caller_activity["speaking"]:
+            stop_voice_for_spoken_interruption("Response became ready during caller speech")
 
 
     def stop_voice_for_spoken_interruption(
@@ -2972,10 +3002,8 @@ async def websocket_endpoint(
 
             return False
 
-        mark_ai_audio_stopped(
-            tts_state["generation"]
-        )
-
+        stopped_generation = tts_state["generation"]
+        mark_ai_audio_stopped(stopped_generation)
         tts_state["generation"] += 1
         tts_state["active"] = False
         tts_state["text"] = ""
@@ -2988,6 +3016,7 @@ async def websocket_endpoint(
         result_queue.put_nowait(
             {
                 "type": "tts_stop",
+                "generation": stopped_generation,
                 "reason": reason,
             }
         )
@@ -3365,6 +3394,15 @@ async def websocket_endpoint(
                         ],
                     )
 
+                active_prompt = browser_prompt_context.token(receptionist.session_state)
+                captured_prompt = browser_prompt_context.capture((latency_turn or {}).get('speech_start_perf'))
+                receptionist.session_state['language_delivery_v9'] = {
+                    'channel': 'browser',
+                    'matches_readback': bool(active_prompt is not None and captured_prompt == active_prompt),
+                }
+                from copy import deepcopy
+                booking_before = deepcopy(receptionist.session_state.get('same_call_booking_v1'))
+                management_before = deepcopy(receptionist.session_state.get('management_commit_v6'))
                 ai_text = (
                     await asyncio.to_thread(
                         receptionist.process_turn,
@@ -3372,6 +3410,17 @@ async def websocket_endpoint(
                         speaker_assessment,
                     )
                 )
+                booking_finished = bool(receptionist.session_state.get('same_call_booking_v1')) and receptionist.session_state.get('same_call_booking_v1') != booking_before
+                management_finished = receptionist.session_state.get('management_commit_v6') != management_before
+                if not receptionist_queue.empty() and not booking_finished and not management_finished:
+                    if receptionist.messages and receptionist.messages[-1].get('role') == 'assistant' and receptionist.messages[-1].get('content') == ai_text:
+                        receptionist.messages.pop()
+                    append_conversation_block("BROWSER RESPONSE SUPERSEDED", [("Turn", latency_turn_id), ("Reason", "A newer completed caller turn is queued; prepared state retained")])
+                    continue
+                receptionist.session_state['language_browser_prompt_v9'] = {
+                    'turn_id': latency_turn_id,
+                    'pending': json.dumps(receptionist.session_state.get('pending_action'), sort_keys=True, default=str),
+                }
 
 
                 if latency_turn is not None:
@@ -3437,17 +3486,12 @@ async def websocket_endpoint(
                 ) as error_log:
                     error_log.write(repr(error))
 
-                result_queue.put_nowait(
-                    {
-
-                        "type":
-                            "ai_response",
-
-                        "text":
-                            "I'm sorry, I had trouble processing that. "
-                            "Could you please try again?"
-                    }
-                )
+                receptionist.session_state['pending_action'] = None
+                receptionist.session_state['phone_result_uncertain_v4'] = True
+                result_queue.put_nowait({
+                    "type": "ai_response",
+                    "text": "I could not verify the result of that request. If you were confirming an appointment action, please check the appointment before repeating it. I can still help with general enquiries.",
+                })
 
 
     # ========================================================
@@ -3576,6 +3620,8 @@ async def websocket_endpoint(
 
                 combined_confidence = final_turn_state["last_confidence"]
                 completed_speaker_audio = final_turn_state["completed_speaker_audio"]
+                speech_start_for_reply = final_turn_state.get("speech_start_perf")
+                final_turn_state["speech_start_perf"] = None
                 final_turn_state["completed_speaker_audio"] = b""
                 final_turn_state["parts"].clear()
                 final_turn_state["task"] = None
@@ -3593,6 +3639,7 @@ async def websocket_endpoint(
                     )
 
                     latency_turn = {
+                        "speech_start_perf": speech_start_for_reply,
                         "turn_id":
                             latency_turn_id,
 
@@ -4351,6 +4398,13 @@ async def websocket_endpoint(
                                     browser_message
                                 )
 
+                            elif browser_message_type == "tts_playback_ended":
+                                if (browser_message.get("generation") == tts_state["generation"]
+                                        and tts_state.get("sending_complete")):
+                                    tts_state["active"] = False
+                                    tts_state["text"] = ""
+                                    append_conversation_block("BROWSER PLAYBACK ENDED", [("Generation", tts_state["generation"])])
+
                             elif (
                                 browser_message_type
                                 == "wer_reference"
@@ -4456,6 +4510,10 @@ async def websocket_endpoint(
                             )
 
                             if "start" in vad_event:
+                                caller_activity["speaking"] = True
+                                stop_voice_for_spoken_interruption("Silero detected caller speech")
+                                if final_turn_state.get("speech_start_perf") is None:
+                                    final_turn_state["speech_start_perf"] = time.perf_counter()
                                 final_turn_state["speaker_audio"].clear()
                                 final_turn_state["speaking"] = True
                                 final_turn_state["speech_end_perf"] = None
@@ -4469,6 +4527,7 @@ async def websocket_endpoint(
                                 final_turn_state["task"] = None
 
                             if "end" in vad_event:
+                                caller_activity["speaking"] = False
                                 final_turn_state["speaker_audio"].extend(audio_bytes)
                                 final_turn_state["completed_speaker_audio"] = bytes(
                                     final_turn_state["speaker_audio"]
@@ -4608,10 +4667,8 @@ async def websocket_endpoint(
             )
         )
 
-        mark_ai_audio_stopped(
-            tts_state["generation"]
-        )
-
+        stopped_generation = tts_state["generation"]
+        mark_ai_audio_stopped(stopped_generation)
         tts_state["generation"] += 1
         tts_state["active"] = False
         tts_state["text"] = ""

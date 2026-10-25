@@ -441,6 +441,9 @@ async def twilio_media_stream(websocket: WebSocket):
     turn_pending = False
     queued_final_turns: list[tuple[str, bytes, str | None]] = []
     tts_playing = False
+    tts_generation = 0
+    audio_delivery_task = None
+    pending_playback_mark = None
     tts_started_at = 0.0
     barge_in_in_progress = False
     last_transcript_at = 0.0
@@ -459,7 +462,7 @@ async def twilio_media_stream(websocket: WebSocket):
     )
 
     async def speak(text: str):
-        nonlocal tts_playing, tts_started_at
+        nonlocal tts_playing, tts_started_at, tts_generation, audio_delivery_task, pending_playback_mark
         if closed or not stream_sid or not text.strip():
             return
         async with tts_lock:
@@ -471,15 +474,24 @@ async def twilio_media_stream(websocket: WebSocket):
                 or ("full name" in lower_text and "?" in lower_text)
                 or ("spell" in lower_text and "surname" in lower_text)
             )
+            tts_generation += 1
+            generation = tts_generation
             tts_playing = True
+            pending_playback_mark = None
+            sent_complete = False
             tts_started_at = time.monotonic()
             write_call_evidence(evidence_path, "AI RESPONSE", [("Text", text)])
             try:
                 prompt_token = prompt_context.spoken_token(receptionist.session_state, text)
-                metrics = await send_aura2_to_twilio(
+                audio_delivery_task = asyncio.create_task(send_aura2_to_twilio(
                     websocket, stream_sid, text,
                     on_first_audio=lambda: prompt_context.publish(len(inbound_pcm16)//2, prompt_token),
-                )
+                ))
+                metrics = await audio_delivery_task
+                if generation == tts_generation and metrics.get("frames_sent", 0):
+                    pending_playback_mark = "clinic-playback-" + str(generation)
+                    await websocket.send_text(json.dumps({"event":"mark", "streamSid":stream_sid, "mark":{"name":pending_playback_mark}}))
+                    sent_complete = True
                 write_call_evidence(
                     evidence_path,
                     "TTS DELIVERY COMPLETE",
@@ -491,7 +503,11 @@ async def twilio_media_stream(websocket: WebSocket):
                     "TTS DELIVERY INTERRUPTED",
                     [("Reason", "Confirmed caller speech during playback")],
                 )
-                raise
+                if asyncio.current_task().cancelling():
+                    raise
+                # Only the child audio task was cancelled by barge-in.
+                # The caller-turn worker and its queue must stay alive.
+                return
             except Exception as error:
                 write_call_evidence(
                     evidence_path,
@@ -503,7 +519,11 @@ async def twilio_media_stream(websocket: WebSocket):
                 )
                 return
             finally:
-                tts_playing = False
+                if generation == tts_generation:
+                    audio_delivery_task = None
+                    if not sent_complete:
+                        tts_playing = False
+                        pending_playback_mark = None
 
     async def process_completed_turn(transcript: str, speaker_pcm16: bytes, reply_to_prompt=None):
         nonlocal speaking_task
@@ -605,6 +625,9 @@ async def twilio_media_stream(websocket: WebSocket):
                     )
             speaker_finished = time.perf_counter()
             controller_started = time.perf_counter()
+            receptionist.session_state['language_delivery_v9'] = {
+                'channel': 'phone', 'matches_readback': bool(active_prompt is not None and reply_to_prompt == active_prompt),
+            }
             controller_task = asyncio.create_task(asyncio.to_thread(
                 receptionist.process_turn, transcript, speaker_assessment,
             ))
@@ -644,8 +667,7 @@ async def twilio_media_stream(websocket: WebSocket):
                                bool(receptionist.session_state.get('same_call_booking_v1')))
             management_completed = receptionist.session_state.get('management_commit_v6') != management_before
             if queued_final_turns and not booking_created and not management_completed:
-                if receptionist.session_state.get('pending_action') != pending_before:
-                    receptionist.session_state['pending_action'] = None
+                # Keep the prepared proposal; an undelivered prompt cannot authorise a write.
                 if receptionist.messages and receptionist.messages[-1].get('role') == 'assistant' and receptionist.messages[-1].get('content') == response:
                     receptionist.messages.pop()
                 write_call_evidence(evidence_path, "RESPONSE SUPERSEDED BEFORE PLAYBACK", [("Reason", "A newer completed caller turn is waiting")])
@@ -717,7 +739,7 @@ async def twilio_media_stream(websocket: WebSocket):
         active_turn_task = asyncio.create_task(run_one_turn())
 
     async def interrupt_tts_for_caller_speech(transcript: str):
-        nonlocal barge_in_in_progress, tts_playing
+        nonlocal barge_in_in_progress, tts_playing, tts_generation, pending_playback_mark
         if (
             barge_in_in_progress
             or not tts_playing
@@ -730,17 +752,17 @@ async def twilio_media_stream(websocket: WebSocket):
                 "CONFIRMED PHONE BARGE-IN",
                 [("Recognized caller speech", transcript)],
             )
+            tts_generation += 1
+            pending_playback_mark = None
+            if audio_delivery_task is not None and not audio_delivery_task.done():
+                audio_delivery_task.cancel()
+            tts_playing = False
             try:
                 await websocket.send_text(
                     json.dumps({"event": "clear", "streamSid": stream_sid})
                 )
             except (WebSocketDisconnect, RuntimeError):
                 pass
-            if greeting_task is not None and not greeting_task.done():
-                greeting_task.cancel()
-            elif speaking_task is not None and not speaking_task.done():
-                speaking_task.cancel()
-            tts_playing = False
         finally:
             barge_in_in_progress = False
 
@@ -799,6 +821,8 @@ async def twilio_media_stream(websocket: WebSocket):
             message_type = str(getattr(message, "type", ""))
             if message_type == "SpeechStarted":
                 turn_assembler.caller_is_speaking()
+                if tts_playing:
+                    asyncio.create_task(interrupt_tts_for_caller_speech("SpeechStarted event"))
                 return
             if message_type == "UtteranceEnd":
                 turn_assembler.schedule(dispatch_final_turn)
@@ -859,6 +883,14 @@ async def twilio_media_stream(websocket: WebSocket):
                         greeting_task = asyncio.create_task(
                             speak("Hello, welcome to the clinic. How can I help you today?")
                         )
+                    continue
+
+                if event == "mark":
+                    mark_name = message.get("mark", {}).get("name")
+                    if pending_playback_mark is not None and mark_name == pending_playback_mark:
+                        pending_playback_mark = None
+                        tts_playing = False
+                        write_call_evidence(evidence_path, "PHONE PLAYBACK ENDED", [("Generation", tts_generation)])
                     continue
 
                 if event == "media":
