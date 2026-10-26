@@ -3157,6 +3157,7 @@ async def websocket_endpoint(
                     )
 
                     follow_up_markers = (
+                        "please say", "please spell", "please repeat", "please give", "please continue", "please clarify",
                         "please provide",
                         "please tell me",
                         "please choose",
@@ -3606,7 +3607,9 @@ async def websocket_endpoint(
             async def flush_final_patient_turn():
 
                 try:
-                    await asyncio.sleep(0.25)
+                    name_flow = receptionist.session_state.get("nameflow_v1") or {}
+                    name_pause = 1.2 if name_flow.get("stage") in {"collect", "readback", "handoff"} else 0.25
+                    await asyncio.sleep(name_pause)
                 except asyncio.CancelledError:
                     return
 
@@ -4132,6 +4135,14 @@ async def websocket_endpoint(
                         }
                     )
 
+
+                    # A low-confidence name fragment must not interrupt an
+                    # ongoing spelling turn or discard accepted neighbouring letters.
+                    name_flow = receptionist.session_state.get("nameflow_v1") or {}
+                    if (not confidence_decision["send_to_llm"]
+                        and name_flow.get("stage") in {"collect", "readback", "handoff"}
+                        and (final_turn_state["speaking"] or final_turn_state["parts"])):
+                        return
 
                     # =========================================
                     # ACCEPTED TRANSCRIPT TO RECEPTIONIST

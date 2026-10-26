@@ -4325,7 +4325,8 @@ class ReceptionistSession:
             self.session_state['pending_action'] = None
             return 'I have stopped this booking request. No appointment has been created.'
         if flow['stage'] == 'handoff':
-            return 'I could not verify the name from this audio. Please use human-assisted completion; I have not created an appointment.'
+            flow.update(stage='collect',attempts=0)
+            return 'We can continue here. Please repeat or spell only the name part that needs correcting. Your appointment selection is kept.'
         yes = {'yes', 'yeah', 'yep', 'correct', 'ok', 'okay', 'yes ok', 'yes okay',
                'yes correct', 'yes that is correct', 'that is correct', 'yes it is correct',
                'yes the spelling is correct', 'the spelling is correct', 'yes please',
@@ -4365,8 +4366,8 @@ class ReceptionistSession:
             flow['stage'] = 'collect'
             flow['attempts'] += 1
             if flow['attempts'] >= 2:
-                flow['stage'] = 'handoff'
-                return 'I could not verify the exact name. Please use human-assisted completion; no appointment has been created.'
+                flow['attempts'] = 0
+                return 'We can correct the name here. Please spell only the incorrect part and say whether it is the first name or surname. Your appointment details are kept.'
             return 'Please spell only the incorrect part, and tell me whether it is the first or last name.'
         if groups:
             old_parts = flow['parts']
@@ -4398,8 +4399,8 @@ class ReceptionistSession:
             return self._nameflow_readback(flow)
         flow['attempts'] += 1
         if flow['attempts'] >= 2:
-            flow['stage'] = 'handoff'
-            return 'The audio has not captured the letters clearly. Please use human-assisted completion; no appointment has been created.'
+            flow['attempts'] = 0
+            return 'I still need to clarify that name part. Please say whether it is the first name or surname, or spell just that part. Your appointment selection is kept.'
         if flow['stage'] == 'readback':
             return 'Please say yes if the name and spelling I read back are correct, or no to correct them.'
         # A misheard name starting with "no" is not treated as cancellation.
@@ -4427,7 +4428,7 @@ class ReceptionistSession:
         # Handle spelling/confirmation directly. All other turns remain normal conversation.
         # Do not classify arbitrary utterances as failed spelling attempts.
         name_turn = bool(groups or positive or normalized in name_rejections | stop_requests
-            or re.search(r'\b(?:my name|first name|last name|full name|surname|spell|spelling|letter)\b', normalized))
+            or re.search(r'\b(?:my name|first name|last name|full name|complete name|whole name|surname|spell|spelling|letter)\b', normalized))
         delegated_from_flow = False
         if flow and not self.session_state.get('speaker_change_pending'):
             if name_turn:
@@ -4711,7 +4712,7 @@ class ReceptionistSession:
             if not intent:
                 flow['attempts'] += 1
             if flow['attempts'] >= 2:
-                return self._lookup_reply(text, 'I could not capture the spelling reliably. Please use human-assisted completion; no appointment has been changed.')
+                return self._lookup_reply(text, 'We can continue here. Please clarify or spell only the name part that needs correcting. No appointment has been changed.')
             return self._lookup_reply(text, 'To find your existing booking, please spell your complete full name letter by letter, with a pause between the first and last name.')
         answer = self._process_before_lookup_repair(text, speaker_assessment)
         if self.session_state.get('lookup_operation') and answer.startswith('Your name and spelling are already verified'):
@@ -7106,6 +7107,152 @@ class ReceptionistSession:
                 self.session_state.pop('language_delivery_v9',None)
                 return self._lookup_reply(patient_text,prompt)
         return self._process_before_transport_v11(patient_text,speaker_assessment)
+
+
+    _name_handler_before_v12 = _nameflow_handle
+
+    def _name_field_reply_v12(self, text):
+        import re
+        raw=str(text or '').strip().lower().replace('’',"'")
+        # Accept either 'my first name is Asha' or 'Asha is my first name'.
+        name=r"[a-z][a-z'-]*(?: [a-z][a-z'-]*){0,3}"
+        label=r'(?:first name|given name|last name|family name|surname)'
+        patterns=[r"^(?:(?:my|the patient s|the patient's|his|her) )?("+label+r")\s*(?:is|would be|:)\s*("+name+r")[.!?]*$",
+                  r"^("+name+r")\s+is\s+(?:(?:my|the|his|her) )?("+label+r")[.!?]*$"]
+        for i,pattern in enumerate(patterns):
+            match=re.match(pattern,raw)
+            if match:
+                kind,value=(match[1],match[2]) if i==0 else (match[2],match[1])
+                if any(word in value.split() for word in ('please','correct','spelled','spell','name','yes','no','is')):continue
+                return ('first' if kind in {'first name','given name'} else 'last',value)
+        return None
+
+    def _nameflow_handle(self, text, flow):
+        import re
+        value=self._normalize_confirmation_text(text)
+        if value in {'stop','stop please','never mind','do not book','don t book','cancel this request','i do not want to book','i don t want to book'}:
+            return self._name_handler_before_v12(text,flow)
+        if flow.get('stage')=='handoff':
+            flow['stage']='collect';flow['attempts']=0
+        groups=self._nameflow_groups(text)
+        field=self._name_field_reply_v12(text)
+        pending=flow.get('unassigned_part_v12')
+        conflict=flow.get('name_conflict_v12')
+        spoken=flow.setdefault('spelled_parts_v12',{})
+        parts=list(flow.get('parts') or [])
+        labelled=('first' if re.search(r'\b(?:first name|given name)\b',value) else
+                  'last' if re.search(r'\b(?:last name|family name|surname)\b',value) else None)
+        if pending and field and field[1] in {'that','this','it','those letters','the spelling'}:
+            field=(field[0],pending)
+        if pending and not field and not groups and re.search(r'\b(?:complete|full|whole) name\b',value):
+            flow.update(parts=([parts[0],pending] if len(parts)==2 else parts+[pending]) if parts and pending not in parts else [pending],attempts=0)
+            if parts:spoken['last']=pending
+            flow.pop('unassigned_part_v12',None)
+            flow.pop('awaiting_next_part_v12',None)
+            return self._nameflow_readback(flow)
+        if not pending and not groups and parts and value in {'complete name','my complete name','full name','my full name','the complete name'}:
+            if flow.get('awaiting_next_part_v12'):
+                flow.pop('awaiting_next_part_v12',None)
+            return self._nameflow_readback(flow)
+        if pending and not field and not groups and labelled:
+            field=(labelled,pending)
+        if conflict and groups and len(groups)==1 and not labelled:
+            labelled=conflict['field'];field=(labelled,groups[0])
+        if field and not groups:
+            kind,name=field
+            letters=self._name_letters(name)
+            old_spelling=spoken.get(kind)
+            if old_spelling and old_spelling!=letters and letters!=pending:
+                flow['name_conflict_v12']={'field':kind,'spoken':name,'spelled':old_spelling}
+                flow['stage']='collect';self.session_state['pending_name_verification']=None
+                self.session_state['pending_action']=None
+                return ('I heard '+name.title()+', but the earlier letters were '+', '.join(old_spelling.upper())+'. Please spell only the '+('first name' if kind=='first' else 'surname')+' you want saved. I have kept the appointment details.')
+        if conflict and not groups:
+            return 'Please spell only the '+('first name' if conflict['field']=='first' else 'surname')+' so I can resolve that spelling difference. Your appointment selection is still kept.'
+        if field or (labelled and len(groups)==1):
+            kind=labelled if groups else field[0]
+            letters=groups[0] if groups else self._name_letters(field[1])
+            if not letters:return 'Please repeat just that name part, or spell it.'
+            if kind=='first':
+                parts=[letters]+parts[1:] if parts else [letters]
+            elif len(parts)>=2:
+                parts=parts[:-1]+[letters]
+            elif parts:
+                parts=parts+[letters]
+            else:
+                flow['unassigned_part_v12']=letters
+                flow['unassigned_label_v12']='last'
+                return 'I have the surname. What is the first name?'
+            if kind=='first' and pending and flow.get('unassigned_label_v12')=='last':
+                parts=[letters,pending]
+                spoken['last']=pending
+                flow.pop('unassigned_label_v12',None)
+                flow.pop('unassigned_part_v12',None)
+            if groups:spoken[kind]=letters
+            elif pending and letters==pending:spoken[kind]=letters
+            flow.update(parts=parts,attempts=0)
+            if pending and (letters==pending or kind=='last'):
+                flow.pop('unassigned_part_v12',None)
+            flow.pop('name_conflict_v12',None)
+            self.session_state['pending_action']=None
+            if len(parts)==1:
+                flow['stage']='collect';flow['awaiting_next_part_v12']=True
+                return 'I have the first name '+parts[0].title()+'. Please say or spell the remaining name part. If that is your complete name, tell me that.'
+            flow.pop('awaiting_next_part_v12',None)
+            if pending and flow.get('unassigned_part_v12'):
+                return 'I have the first name '+parts[0].title()+'. Are the letters '+', '.join(pending.upper())+' for the surname? Please say which name part they belong to.'
+            return self._nameflow_readback(flow)
+        if len(groups)==1 and parts and not labelled:
+            joined=groups[0]
+            first=parts[0]
+            if len(joined)>len(first)+1 and joined.startswith(first):
+                flow.update(parts=[first,joined[len(first):]],attempts=0)
+                flow.pop('unassigned_part_v12',None)
+                flow.pop('awaiting_next_part_v12',None)
+                self.session_state['pending_action']=None
+                return self._nameflow_readback(flow)
+        if flow.get('awaiting_next_part_v12'):
+            if re.search(r'\b(?:that is|that s|it is|this is) (?:my |the )?(?:complete|full|whole|only) name\b|\b(?:no surname|no last name|only one name)\b',value):
+                flow.pop('awaiting_next_part_v12',None)
+                return self._nameflow_readback(flow)
+            if len(groups)==1:
+                if flow.get('unassigned_label_v12')=='last':
+                    parts=[groups[0]]+parts
+                    spoken['first']=groups[0]
+                elif groups[0] not in parts:
+                    parts.append(groups[0]);spoken['last']=groups[0]
+                flow.update(parts=parts,attempts=0)
+                flow.pop('awaiting_next_part_v12',None)
+                return self._nameflow_readback(flow)
+            if self._name_spelling_positive(text):
+                return 'Is '+(' '.join(parts)).title()+' your complete name, or is there another name part?'
+        # If a whole name and the first spelling arrive together, allow the
+        # surname to continue in the next utterance instead of finalising early.
+        if len(groups)==1 and not parts and re.search(r'\b(?:full name|patient s name|patient name|my name)\b',value):
+            flow.update(parts=list(groups),stage='collect',attempts=0,awaiting_next_part_v12=True)
+            spoken['first']=groups[0]
+            self.session_state['pending_action']=None
+            self.session_state['pending_name_verification']=None
+            return 'I captured '+groups[0].title()+', spelled '+', '.join(groups[0].upper())+'. Please continue with the remaining name part. If that is the complete name, tell me that.'
+        if len(groups)==1 and flow.get('stage')=='readback' and not labelled:
+            flow['unassigned_part_v12']=groups[0]
+            return 'I captured '+', '.join(groups[0].upper())+'. Is that for the first name, surname, or the complete name?'
+        # Clearly introduced spoken full names can be read back for confirmation;
+        # they are not verified merely because ASR supplied high confidence.
+        full=re.match(r"^(?:(?:the )?patient(?:'s| s)? full name|my full name|my name|the name) (?:is|would be) ([a-z][a-z'-]*(?: [a-z][a-z'-]*){1,4})[.!?]*$",str(text or '').strip().lower())
+        if full and not groups:
+            flow['spelled_parts_v12']={}
+            flow.pop('unassigned_part_v12',None)
+            flow.update(parts=[self._name_letters(p) for p in full[1].split()],attempts=0)
+            flow.pop('awaiting_next_part_v12',None)
+            self.session_state['pending_action']=None
+            return self._nameflow_readback(flow)
+        if len(groups)>=2:
+            flow.pop('name_conflict_v12',None)
+            spoken.update(first=groups[0],last=groups[-1])
+            flow.pop('awaiting_next_part_v12',None)
+            flow.pop('unassigned_part_v12',None)
+        return self._name_handler_before_v12(text,flow)
 
 
 def create_receptionist_session():
